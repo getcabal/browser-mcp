@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Local Browser MCP",
+  "version": "1.0.0",
+  "description": "Local-only browser control for MCP clients. The control channel never leaves this machine.",
+  "permissions": ["debugger", "storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": {
+    "default_title": "Local Browser MCP",
+    "default_popup": "popup.html"
+  }
+}

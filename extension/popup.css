@@ -1,0 +1,7 @@
+:root { color-scheme: dark; font: 13px/1.45 system-ui,sans-serif; }
+body { width:310px; margin:0; padding:18px; background:#111318; color:#eef1f7; }
+main { display:flex; align-items:center; gap:12px; }
+.mark { display:grid; place-items:center; width:42px; height:42px; border-radius:13px; background:linear-gradient(135deg,#8b5cf6,#22d3ee); color:white; font-weight:800; font-size:20px; }
+h1 { margin:0; font-size:18px; } p { margin:3px 0 0; color:#aeb7c7; }
+section { display:grid; grid-template-columns:1fr auto; gap:9px; margin-top:18px; padding:13px; border:1px solid #2a303b; border-radius:12px; background:#181c23; }
+strong { color:#5ee6a8; } code { color:#8bd5ff; } .note { margin-top:13px; font-size:12px; }
