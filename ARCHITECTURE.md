@@ -12,25 +12,25 @@ one file and prevents a build step from silently retaining hosted-relay code.
 
 ## The contract as data
 
-The reviewed 24-tool contract (22 established tools + 2 local extras) exists in
-two deliberately duplicated places:
+The 24-tool surface (22 Vibe-compatible tools + 2 local extras) exists in two
+deliberately duplicated production places:
 
-- `server/src/contract.ts` — the canonical TypeScript source. Provides
+- `server/src/contract.ts` — the server-side production copy. Provides
   `validateExtensionTools()` (exact-match validation of what the extension
   advertises) and `enrichTools()` (adds titles and MCP annotations to
   tools/list).
 - `extension/tools.js` — a pure-data ES module with no `chrome.*` references,
   importable both by the service worker and by Node test code.
 
-They must stay byte-identical in names, descriptions, and inputSchemas. The
+They must stay byte-identical in order, titles, descriptions, inputSchemas,
+defaults, and annotations. The
 duplication is intentional: the extension must not depend on server build
 output, and the server must not parse extension source. The
-`server/test/contract-sync.mjs` suite deep-compares the two (plus a hard-coded
-expected-name table derived from the reviewed contract), so any drift — a
-renamed tool, a changed parameter, a version bump missed in one place — fails
-the build rather than silently changing the MCP surface. The same mechanism is
-what lets the server *reject* an extension advertising a drifted contract at
-runtime.
+`server/test/contract-sync.mjs` suite deep-compares both against the independent
+`server/test/fixtures/vibe-tools-0.3.6.json` capture taken from the live Vibe
+MCP. A renamed tool, changed description/default/schema, or missed version bump
+fails the build. Runtime validation also compares descriptions and schemas, so
+a drifted extension cannot satisfy required-extension startup.
 
 ## Connection handshake
 
@@ -54,10 +54,12 @@ Two properties matter:
   clear the advertised tools.
 - **Fail closed, stay closed.** On receiving a 4400/4403/4426 close (or a pong
   whose profile/protocol contradicts its own config), the extension records a
-  FATAL state in `chrome.storage.session` and stops reconnecting — a stamped
+  FATAL state in `chrome.storage.session` and stops reconnecting — a stamped,
+  locked
   `fleet-1` extension will not retry its way into controlling the `fleet-0`
-  server. Changing the port/profile in the options page (or the popup's
-  Reconnect button) clears FATAL. Profile comparison is strict equality
+  server. Fleet `config.js` files use `locked=true`, so storage/options cannot
+  retarget them; only unlocked development builds accept those overrides. The
+  popup's Reconnect button clears FATAL. Profile comparison is strict equality
   including the unset case: `null === null` passes, everything else fails.
 
 The extension re-sends its hello every 15 seconds as a heartbeat; the server
@@ -84,7 +86,7 @@ the process exits 1 rather than degrade silently.
 2. The server assigns a unique local request ID and stores the pending promise
    with a per-tool timeout (wait tools: their requested timeout plus margin;
    navigation tools: their readiness budget plus margin; default 90s).
-3. The extension dispatches the named tool through an explicit switch.
+3. The extension dispatches the named tool through an explicit executor table.
 4. Chrome performs the operation through `chrome.tabs` or `chrome.debugger`.
 5. Long-running tools emit `tool_progress` every 15 seconds; each frame
    **resets** the server-side pending timer, so a 5-minute `wait_for` survives
@@ -101,7 +103,8 @@ promotion.
 
 ## Element references
 
-`take_snapshot` reads Chrome's accessibility tree and maps compact `@eN`
+`take_snapshot` reads Chrome's accessibility tree in markdown,
+accessibility-tree, or ARIA form and maps compact `@eN`
 identifiers to backend DOM node IDs, kept per tab. Uids are valid only for the
 latest snapshot: a new snapshot rebuilds and renumbers the map, and a page
 navigation (`tabs.onUpdated` → `loading`) clears it. Interaction resolves the
@@ -116,19 +119,20 @@ Two distinct semantics, matching the reference implementation:
 
 - **Readiness** (`new_page`, `navigate_page`, `switch_to_page`): after
   initiating, wait 150ms, then poll tab load status every 150ms up to the
-  budget (default 15s). Timeout **degrades to success** with the warning suffix
+  budget (45s for creation/navigation, 15s for switching). Timeout **degrades
+  to success** with the warning suffix
   `(page did not reach readyState=complete within Ns; it may still be loading)`
   — navigation started, the page is real, and erroring would only make agents
   retry a navigation that already happened.
 - **Waits** (`wait_for`, `wait_for_url`, `wait_for_network_idle`,
-  `wait_for_condition`): poll every ~250ms up to `timeout` (default 30s, cap
-  300s) and **hard-error** on expiry with `Timed out after Nms waiting for …`
+  `wait_for_condition`): poll up to the Vibe defaults (10s for text/DOM quiet,
+  15s for URL/condition) and **hard-error** on expiry with `Timed out after Nms waiting for …`
   (including the last evaluation error for `wait_for_condition`) — here the
   caller asked a yes/no question about the page and deserves a truthful no.
 
-`wait_for_network_idle` counts in-flight requests via CDP Network events,
-excluding WebSocket/EventSource (which legitimately stay open); idle means zero
-in-flight continuously for `idleMs`.
+Despite its compatibility name, `wait_for_network_idle` truthfully implements
+the reference behavior: document readiness plus a DOM-mutation quiet window
+(800ms by default). It does not claim that all network traffic has stopped.
 
 ## Keyboard synthesis
 
@@ -154,8 +158,8 @@ killing one instance does not disturb the others.
 Deployment verification closes the loop: `scripts/package-extension.mjs`
 produces deterministic artifacts (store-method zips, fixed 1980 timestamps,
 sorted entries) plus `artifacts.json` content hashes, and
-`scripts/doctor.mjs --extension-dir` recomputes an installed copy's hash to
-prove exactly which version/profile/port is deployed.
+`scripts/doctor.mjs --extension-dir` hashes an installed copy before parsing
+its inert JSON config, then proves the version/profile/port and locked state.
 
 ## Intentionally omitted
 

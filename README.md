@@ -7,10 +7,10 @@ no account, hosted service, routing identifier, access token, or remote relay.
 This directory is the complete project. Copy it anywhere; it does not import,
 link to, or execute files from its parent repository.
 
-It preserves the established 22-tool browser MCP contract exactly — tool names,
-parameter names, and response formats — so agents, prompts, and skills written
-against that contract work unchanged. Two extra prototype tools are kept and
-clearly marked as local extras.
+It preserves the live `@vibebrowser/mcp@0.3.6` 22-tool MCP contract exactly —
+order, names, titles, descriptions, input schemas, defaults, and annotations —
+so agents, prompts, and skills written against that contract work unchanged.
+Two local convenience tools remain beyond that compatibility boundary.
 
 ## How it works
 
@@ -21,7 +21,7 @@ MCP client ── stdio ──> Node.js server ── ws://127.0.0.1:<port> ─�
 - MCP is exposed only through the child process's standard input/output.
 - The extension bridge binds explicitly to IPv4 loopback.
 - The extension connects only to `ws://127.0.0.1:<port>` — the port comes from
-  its stamped `config.js` or the options page, never from a remote address.
+  `config.js` or, in an unlocked development build, the options page.
 - Server and extension complete a fail-closed handshake (profile name and
   protocol version) before any tool traffic flows.
 - There is no remotely reachable server mode.
@@ -65,11 +65,11 @@ Chrome displays a debugger-control banner while the extension is attached to a
 tab. This is expected because browser actions use Chrome's supported debugger
 API.
 
-The extension's **options page** (right-click the toolbar icon → Options, or
-`chrome://extensions` → Details → Extension options) sets the port and profile
-at runtime; values stored there override the stamped `config.js` defaults.
-The toolbar popup shows the effective port, profile, connection state, and any
-handshake rejection, with a Reconnect button.
+The base development extension is intentionally unlocked: its **options page**
+(right-click the toolbar icon → Options) may override the default port/profile.
+Packaged fleet copies are stamped with `locked=true`; stored overrides are
+ignored and the options controls are disabled, so a deployed profile cannot be
+retargeted. The toolbar popup shows the effective route and connection state.
 
 ### Configure your MCP client
 
@@ -83,7 +83,7 @@ Replace `/path/to/local-browser-mcp` with the absolute path to this directory:
       "args": [
         "/path/to/local-browser-mcp/server/dist/cli.js",
         "--require-extension",
-        "--extension-connect-timeout", "15000"
+        "--extension-connect-timeout", "90000"
       ]
     }
   }
@@ -101,14 +101,20 @@ CLI flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--extension-port <port>` | `19889` | Loopback port the bridge listens on |
+| `--port <port>` | `19889` | Vibe-compatible alias for `--extension-port` |
 | `--profile <name>` | none | Expected extension profile; mismatches are rejected (close 4403) |
 | `--require-extension` | off | Fail startup unless the full tool contract is published |
-| `--extension-connect-timeout <ms>` | `10000` | How long `--require-extension` waits |
+| `--extension-connect-timeout <ms>` | `90000` | How long `--require-extension` waits |
 | `--debug` | off | Verbose stderr logging |
+
+An optional leading `start` subcommand is accepted. The port can also come from
+`BROWSER_MCP_EXTENSION_PORT`, `HERMES_VIBE_EXTENSION_PORT`, or
+`VIBE_MCP_EXTENSION_PORT` (in that precedence order), and the profile from
+`BROWSER_MCP_PROFILE`.
 
 With `--require-extension`, the server refuses to enter the "success with zero
 tools" state: it waits up to the connect timeout for the extension to connect
-and advertise the exact reviewed contract, then either serves MCP or exits 1
+and advertise the exact Vibe-compatible contract, then either serves MCP or exits 1
 with a clear stderr diagnosis (no extension, wrong profile, or tool drift). If
 the extension later disconnects, an equal-length grace timer runs before the
 server exits rather than serving an empty tool list. Without the flag, startup
@@ -121,32 +127,36 @@ protocol) are fatal and stop reconnection until reconfigured.
 
 ## Browser tools
 
+Every compatible tool also accepts optional `pageStateFormat` with value
+`markdown` or `accessibility_tree`. When supplied, the result appends state
+captured from the exact target page after the operation.
+
 The 22 contract tools, in the advertised order:
 
 | Tool | Required params | Optional params | Notes |
 |---|---|---|---|
-| `list_pages` | — | — | `Found N page(s):` + `Page <id> [ACTIVE]: "title" - url` |
-| `new_page` | `url` | `waitForReady`, `timeoutMs` | Waits for readiness by default |
-| `close_page` | — | `tabId` | Active tab by default |
-| `navigate_page` | `url` | `tabId`, `type`, `timeoutMs` | `type`: `url` \| `back` \| `forward` \| `reload` |
-| `switch_to_page` | `tabId` | — | Activates tab, focuses its window, waits for visibility/readiness |
-| `take_snapshot` | — | `tabId`, `interactive` | Returns `Tab ID:`/`Title:`/`URL:` header + uid tree |
-| `click` | `uid` | `tabId`, `dblClick` | Real CDP mouse events at element center |
-| `fill` | `uid`, `value` | `tabId` | Native value setter + input/change events |
-| `fill_form` | `elements` | `tabId` | `elements`: array of `{uid, value}` |
-| `type_text` | `text` | `uid`, `submitKey`, `tabId` | Per-character key events; optional submit key |
-| `wait_for` | `text` | `timeout`, `tabId` | String or array; all must appear in page text |
-| `wait_for_url` | `url` | `timeout`, `tabId` | Substring match, regex fallback |
-| `wait_for_network_idle` | — | `idleMs`, `timeout`, `tabId` | Idle = zero in-flight requests for `idleMs` (default 500) |
-| `wait_for_condition` | `condition` | `timeout`, `tabId` | Polls a JS expression until truthy |
-| `scroll_page` | — | `direction`, `amount`, `uid`, `tabId` | Page or element scrolling |
-| `press_key` | `keys` | `tabId` | Chords like `Enter`, `Control+a`, `Shift+Tab` |
-| `hover` | `uid` | `tabId` | CDP mouse move to element center |
-| `drag` | `from_uid`, `to_uid` | `tabId` | Pointer drag (press → interpolated moves → release) |
-| `take_screenshot` | — | `tabId`, `fullPage`, `uid` | PNG image block; element or full-page clip |
-| `evaluate_script` | `function` | `args`, `tabId` | Function or expression; promises awaited |
-| `upload_file` | `uid` | `filePath`, `file`, `tabId` | `file`: `{filename, mimeType, contentBase64}` |
-| `resize_page` | `width`, `height` | `tabId` | Viewport emulation |
+| `navigate_page` | `type`, `pageId` | `url`, `timeoutMs` | Exact page; URL navigation defaults to 45s readiness |
+| `list_pages` | — | — | Deterministic page-ID listing with active markers |
+| `new_page` | — | `focus`, `url`, `waitForReady` | Background by default; readiness defaults on |
+| `switch_to_page` | `pageId` | `waitForReady` | Focuses exact tab/window and establishes visibility |
+| `close_page` | `pageId` | — | Refuses to close the final remaining page |
+| `click` | `tabId`, `uid` | `openInNewTab` | Real pointer input; link may open a background tab |
+| `fill` | `tabId`, `uid`, `value` | — | Native setter plus input/change events |
+| `fill_form` | `tabId`, `elements` | — | Ordered array of `{uid, value}` |
+| `upload_file` | `tabId`, `uid` | top-level fields or `file` | Inline base64 only; no host filesystem path |
+| `type_text` | `tabId`, `text` | `submitKey` | Types into the previously focused control |
+| `scroll_page` | `tabId`, `direction`, `numPages` | — | `direction` is `up` or `down` |
+| `wait_for` | `tabId`, `text` | `timeout` | Non-empty text array; resolves when any item appears |
+| `wait_for_url` | `pattern` | `tabId`, `timeout` | Glob (`*`, `?`) or substring matching |
+| `wait_for_network_idle` | — | `tabId`, `idleMs`, `timeout` | Document readiness plus DOM-mutation quiet window |
+| `wait_for_condition` | `expression` | `tabId`, `pollMs`, `timeout` | Polls caller-supplied JavaScript until truthy |
+| `evaluate_script` | `function` | `tabId`, `args` | Function declaration; string arguments; promises awaited |
+| `press_key` | `tabId`, `keys` | `index` | Optional snapshot index focus, then key/chord delivery |
+| `hover` | `tabId`, `index` | `duration` | Holds pointer over snapshot index |
+| `drag` | `tabId`, `source`, `target` | `duration` | Selector, uid/index, or `{x,y}` endpoints |
+| `resize_page` | `tabId`, `width`, `height` | `deviceScaleFactor` | Viewport emulation |
+| `take_screenshot` | `tabId` | `maxWidth`, `grayscale`, `quality`, `detail` | Cost-aware JPEG (PNG at quality 90) image block |
+| `take_snapshot` | — | `format`, `compact`, `maxDepth`, `scopeSelector`, `changedOnly`, `pageId`, `tabId` | Markdown/accessibility/ARIA with stable uids |
 
 Local extras beyond the established contract (kept from the prototype, clearly
 annotated in tools/list):
@@ -159,25 +169,26 @@ annotated in tools/list):
 ### The uid workflow
 
 Call `take_snapshot` before interacting with elements. It returns compact
-references such as `@e12`; pass those as `uid` to `click`, `fill`, `hover`,
-`drag`, and the rest. Uids are valid only for the **latest** snapshot of that
-tab — taking a new snapshot renumbers them, and a page navigation invalidates
+references such as `@e12`; pass those as `uid` to click/fill/upload, or as the
+numeric `index` where the Vibe schema uses an index. Drag accepts a uid/index,
+CSS selector, or coordinates. Uids are valid only for the **latest** snapshot
+of that tab — taking a new snapshot renumbers them, and navigation invalidates
 them. If a uid goes stale the tool fails closed with
 `Element @eN is stale; call take_snapshot again` (after attempting exactly one
 relocation by role and accessible name).
 
 ### Readiness vs. waiting
 
-Navigation-flavored tools (`new_page`, `navigate_page`, `switch_to_page`)
-establish bounded readiness: the extension polls tab status until the page
-completes loading, up to `timeoutMs` (default 15000). On timeout they still
+Navigation-flavored tools establish bounded readiness: `new_page` and
+`navigate_page` use 45 seconds by default, while `switch_to_page` uses 15.
+The extension polls tab status until the page completes loading. On timeout it
 **succeed**, appending the warning suffix
 `(page did not reach readyState=complete within Ns; it may still be loading)`.
 
-The `wait_for*` tools are the opposite: they **hard-error** on timeout with
-`Timed out after Nms waiting for …`. Their `timeout` is in milliseconds,
-default 30000, capped at 300000. Long waits are kept alive end-to-end by
-progress frames that extend the server-side call timer.
+The `wait_for*` tools **hard-error** on timeout with `Timed out after Nms
+waiting for …`. Defaults match Vibe: 10 seconds for text/DOM quiet and 15
+seconds for URL/condition. Long waits are kept alive end-to-end by progress
+frames that extend the server-side call timer.
 
 ## Reliability
 
@@ -247,16 +258,17 @@ npm run doctor -- --extension-dir dist/profiles/alpha
 # or any deployed copy of a stamped directory
 ```
 
-Doctor reports the installed version, port, and profile, and recomputes the
-directory content hash against `dist/artifacts.json` — a modified or stale
-install fails the check and names the mismatch.
+Doctor hashes installed allowlisted files before parsing configuration and
+never imports or executes installed JavaScript. It reports whether the
+effective route is immutable; profile artifacts must be locked and match their
+packaged name/port metadata. Modified or stale installs fail closed.
 
 ### Upgrade and rollback
 
-1. Bump the version in all four places (root `package.json`,
+1. Bump the version in all five places (root `package.json`,
    `server/package.json`, `extension/manifest.json`,
-   `server/src/contract.ts`) — the packager, doctor, and tests all refuse to
-   run with mismatched versions.
+   `server/src/contract.ts`, and `package-lock.json`) — the packager, doctor,
+   and tests all refuse to run with mismatched versions.
 2. `npm test && npm run package -- --profiles fleet.json`.
 3. Replace each deployed directory with the new `dist/profiles/<name>/`, then
    reload the extension in `chrome://extensions` (or restart Chrome).
@@ -281,30 +293,36 @@ install fails the check and names the mismatch.
   JavaScript in the selected page. Remove their entries from
   `extension/tools.js` + `server/src/contract.ts` and their switch cases if your
   threat model does not permit arbitrary page code.
+- `upload_file` accepts owner-supplied inline base64 only. Its schema and
+  executor reject arbitrary host filesystem paths.
 - One server process owns each port. Configure one MCP host process per
   port/profile pair.
 
 ## Testing
 
 ```bash
-npm test          # build + all five suites (below)
+npm test          # build + all seven suites (below)
 npm run test:browser  # just the real-browser suite
 ```
 
 The suite, in order:
 
-1. **contract-sync** — the extension's `tools.js` and the server's
-   `contract.ts` advertise byte-identical schemas for all 24 tools, exact
-   contract names, annotations, and synchronized versions.
+1. **contract-sync** — both production copies deep-match the independent live
+   Vibe 0.3.6 fixture (order, text, schemas, defaults, and annotations), with
+   synchronized package/manifest/lockfile versions.
 2. **e2e** — the real bridge against a scripted fake extension: handshake
    happy path, close codes 4400/4403/4426, progress-extends-timeout, replay
    across reconnects, `waitForContract`.
-3. **profile-isolation** — 12 concurrent bridge+extension pairs stay fully
+3. **mcp-contract** — launches the real stdio CLI using `start --port` and
+   proves its actual tools/list matches the live fixture.
+4. **profile-isolation** — 12 concurrent bridge+extension pairs stay fully
    isolated; a cross-wired profile is rejected without disturbing the others;
    12 parallel calls route correctly.
-4. **local-only-audit** — source-level regex audit that no relay, fetch,
+5. **local-only-audit** — source-level regex audit that no relay, fetch,
    XHR, beacon, or non-loopback WebSocket code exists in any shipped file.
-5. **browser-e2e** — loads a stamped extension into a real headless Chromium
+6. **deployment** — packages locked profile artifacts twice, proves identical
+   hashes, and verifies the inert hash-first doctor path.
+7. **browser-e2e** — loads a stamped extension into a real headless Chromium
    and exercises the full 24-tool surface against local test pages, including
    readiness, uids, key chords, uploads, waits, and screenshots.
 
@@ -331,10 +349,11 @@ CHROME_BIN="$HOME/.cache/puppeteer/chrome/<ver>/chrome-mac-arm64/Google Chrome f
 ```text
 extension/                    Unbundled Manifest V3 Chrome extension
 extension/tools.js            The 24 tool definitions (pure data, Node-importable)
-extension/config.js           Stamped per-profile port/profile defaults
-server/src/contract.ts        Canonical reviewed contract + validation
+extension/config.js           Development defaults or locked stamped fleet route
+server/src/contract.ts        Vibe-compatible production contract + validation
 server/src/                   TypeScript MCP server and loopback bridge
-server/test/                  Five test suites (see Testing)
+server/test/fixtures/         Independent captured Vibe 0.3.6 tools/list fixture
+server/test/                  Seven test suites (see Testing)
 scripts/package-extension.mjs Deterministic zip packager + profile stamping
 scripts/doctor.mjs            Installation and deployment verification
 scripts/clean.mjs             Removes generated output
@@ -344,7 +363,7 @@ scripts/clean.mjs             Removes generated output
 
 ```bash
 npm run build     # Compile the server
-npm test          # Build + all five test suites (requires a Chromium binary)
+npm test          # Build + all seven test suites (requires a Chromium binary)
 npm run doctor    # Check environment, versions, contract; --extension-dir verifies a deploy
 npm run package   # Deterministic extension zips; --profile name:port stamps copies
 npm run clean     # Remove server/dist and dist
