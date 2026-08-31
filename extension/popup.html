@@ -8,8 +8,15 @@
   </head>
   <body>
     <main><div class="mark">L</div><div><h1>Local Browser MCP</h1><p id="status">Checking local bridge…</p></div></main>
-    <section><span>Control channel</span><strong>127.0.0.1 only</strong><span>Extension port</span><code>19889</code></section>
-    <p class="note">No hosted relay, account, UUID, token, or remote-control mode exists in this build.</p>
+    <section>
+      <span>Control channel</span><strong>127.0.0.1 only</strong>
+      <span>Extension port</span><code id="port">…</code>
+      <span>Profile</span><code id="profile">…</code>
+      <span>Version</span><code id="version">…</code>
+    </section>
+    <p id="fatal" class="note" hidden></p>
+    <button id="reconnect" type="button" hidden>Reconnect</button>
+    <p class="note">No hosted relay, account, UUID, token, or remote-control mode exists in this build. Configure port and profile in the extension options.</p>
     <script src="popup.js"></script>
   </body>
 </html>

@@ -5,3 +5,4 @@ main { display:flex; align-items:center; gap:12px; }
 h1 { margin:0; font-size:18px; } p { margin:3px 0 0; color:#aeb7c7; }
 section { display:grid; grid-template-columns:1fr auto; gap:9px; margin-top:18px; padding:13px; border:1px solid #2a303b; border-radius:12px; background:#181c23; }
 strong { color:#5ee6a8; } code { color:#8bd5ff; } .note { margin-top:13px; font-size:12px; }
+button { margin-top:12px; padding:9px 12px; border-radius:9px; border:0; background:linear-gradient(135deg,#8b5cf6,#22d3ee); color:white; font-weight:700; cursor:pointer; width:100%; }

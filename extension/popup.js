@@ -1,6 +1,37 @@
-chrome.runtime.sendMessage({ type: 'local-mcp-status' }, (state) => {
-  const el = document.getElementById('status');
-  if (!state || chrome.runtime.lastError) { el.textContent = 'Service worker unavailable'; return; }
-  el.textContent = state.connected ? 'Connected to the local bridge' : 'Waiting for the local bridge';
-  el.style.color = state.connected ? '#5ee6a8' : '#f5c76d';
+const statusEl = document.getElementById('status');
+const fatalEl = document.getElementById('fatal');
+const reconnectButton = document.getElementById('reconnect');
+
+function refresh() {
+  chrome.runtime.sendMessage({ type: 'local-mcp-status' }, (state) => {
+    if (!state || chrome.runtime.lastError) {
+      statusEl.textContent = 'Service worker unavailable';
+      return;
+    }
+    document.getElementById('port').textContent = String(state.port);
+    document.getElementById('profile').textContent = state.profile === null ? '(none)' : state.profile;
+    document.getElementById('version').textContent = state.version;
+    if (state.fatal) {
+      statusEl.textContent = 'Handshake rejected — reconnect disabled';
+      statusEl.style.color = '#ff8484';
+      fatalEl.textContent = `Server rejected this extension (code ${state.fatal.code}): ${state.fatal.reason}`;
+      fatalEl.hidden = false;
+      reconnectButton.hidden = false;
+      return;
+    }
+    fatalEl.hidden = true;
+    reconnectButton.hidden = true;
+    statusEl.textContent = state.connected ? 'Connected to the local bridge' : 'Waiting for the local bridge';
+    statusEl.style.color = state.connected ? '#5ee6a8' : '#f5c76d';
+  });
+}
+
+reconnectButton.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ type: 'local-mcp-reconnect' }, () => {
+    void chrome.runtime.lastError;
+    setTimeout(refresh, 400);
+  });
 });
+
+refresh();
+setInterval(refresh, 2000);

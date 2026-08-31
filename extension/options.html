@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Local Browser MCP — Options</title>
+    <link rel="stylesheet" href="popup.css">
+    <style>
+      body { width: 360px; }
+      form { display: grid; gap: 10px; margin-top: 16px; }
+      label { display: grid; gap: 4px; color: #aeb7c7; font-size: 12px; }
+      input { padding: 8px 10px; border-radius: 8px; border: 1px solid #2a303b; background: #181c23; color: #eef1f7; font: inherit; }
+      button { padding: 9px 12px; border-radius: 9px; border: 0; background: linear-gradient(135deg,#8b5cf6,#22d3ee); color: white; font-weight: 700; cursor: pointer; }
+      #saved { min-height: 1.2em; }
+    </style>
+  </head>
+  <body>
+    <main><div class="mark">L</div><div><h1>Bridge settings</h1><p>Per-profile connection to the local MCP server</p></div></main>
+    <form id="form">
+      <label>Bridge port (1024–65535; empty = stamped default)
+        <input id="port" type="number" min="1024" max="65535" placeholder="19889">
+      </label>
+      <label>Profile name (must match the server's --profile; empty = none)
+        <input id="profile" type="text" placeholder="e.g. fleet-alpha">
+      </label>
+      <button type="submit">Save and reconnect</button>
+      <p id="saved" class="note"></p>
+    </form>
+    <p class="note">The bridge only ever connects to 127.0.0.1 on this machine.</p>
+    <script src="options.js"></script>
+  </body>
+</html>
