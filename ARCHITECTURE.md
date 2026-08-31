@@ -161,6 +161,22 @@ sorted entries) plus `artifacts.json` content hashes, and
 `scripts/doctor.mjs --extension-dir` hashes an installed copy before parsing
 its inert JSON config, then proves the version/profile/port and locked state.
 
+## Hermes process integration
+
+The raw stdio server deliberately does not launch Chrome. Hermes deployments
+use `scripts/hermes-profile-browser-mcp` to preserve the existing native
+browser-lease boundary: it launches the exact profile-native browser, records
+the non-secret lease contract, renews it, starts Browser MCP on the locked
+extension port/profile, and releases both process and lease on every exit path.
+The MCP server remains the wrapper's stdio child, so the configured server key
+may stay `vibe` and existing `mcp_vibe_*` skill references remain unchanged.
+
+Unlike Vibe's two-port relay, the adapter has no agent port. Hermes talks MCP
+to the child over stdio, and the child owns one IPv4-loopback WebSocket port for
+the profile extension. Loading a locked artifact without activating its
+matching adapter leaves that port unowned; Chrome can record the handled failed
+connection attempt even though the extension's bounded retry logic is working.
+
 ## Intentionally omitted
 
 - Hosted relay and remote WebSocket client

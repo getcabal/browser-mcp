@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/cli.js",
-    "test": "npm run build && node test/contract-sync.mjs && node test/e2e.mjs && node test/mcp-contract.mjs && node test/profile-isolation.mjs && node test/local-only-audit.mjs && node test/deployment.mjs && node test/browser-e2e.mjs",
+    "test": "npm run build && node test/contract-sync.mjs && node test/e2e.mjs && node test/mcp-contract.mjs && node test/profile-isolation.mjs && node test/local-only-audit.mjs && node test/deployment.mjs && node test/hermes-wrapper.mjs && node test/browser-e2e.mjs",
     "test:browser": "npm run build && node test/browser-e2e.mjs"
   },
   "dependencies": {

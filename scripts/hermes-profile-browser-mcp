@@ -1,0 +1,155 @@
+#!/bin/zsh
+set -euo pipefail
+
+# Hermes profile adapter for Browser MCP. It preserves the dedicated browser
+# lease lifecycle previously owned by profile-vibe-mcp while replacing the
+# Vibe relay/client process with this repository's stdio MCP server.
+
+umask 077
+
+: "${BROWSER_MCP_BROWSER_LAUNCHER:?BROWSER_MCP_BROWSER_LAUNCHER is required}"
+: "${BROWSER_MCP_STATE_DIR:?BROWSER_MCP_STATE_DIR is required}"
+: "${BROWSER_MCP_EXTENSION_PORT:?BROWSER_MCP_EXTENSION_PORT is required}"
+: "${BROWSER_MCP_PROFILE:?BROWSER_MCP_PROFILE is required}"
+
+typeset -r browser_mcp_browser_launcher="${BROWSER_MCP_BROWSER_LAUNCHER}"
+typeset -r browser_mcp_state_dir="${BROWSER_MCP_STATE_DIR}"
+typeset -r browser_mcp_extension_port="${BROWSER_MCP_EXTENSION_PORT}"
+typeset -r browser_mcp_profile="${BROWSER_MCP_PROFILE}"
+typeset -r browser_mcp_connect_timeout="${BROWSER_MCP_CONNECT_TIMEOUT_MS:-90000}"
+typeset -r browser_mcp_root="${BROWSER_MCP_ROOT:-${0:A:h:h}}"
+typeset -r browser_mcp_cli="${browser_mcp_root}/server/dist/cli.js"
+typeset -r browser_mcp_node="${BROWSER_MCP_NODE:-$(command -v node || true)}"
+typeset -r browser_mcp_python='/usr/bin/python3'
+typeset -r browser_mcp_start_url="${BROWSER_MCP_START_URL:-https://example.com/}"
+typeset -r browser_mcp_task_url="${browser_mcp_start_url%%#*}#hermes-browser-mcp-task-$$-${RANDOM}${RANDOM}"
+typeset -r browser_mcp_lease_file="${browser_mcp_state_dir}/browser-lease.json"
+typeset -r hermes_home="${HERMES_HOME:-${HOME}/.hermes}"
+
+case "${browser_mcp_browser_launcher}" in
+  "${hermes_home}"/bin/*-browser-native) ;;
+  *)
+    print -u2 'hermes-profile-browser-mcp: browser launcher must be a profile-native Hermes launcher'
+    exit 64
+    ;;
+esac
+
+case "${browser_mcp_state_dir}" in
+  "${hermes_home}"/*) ;;
+  *)
+    print -u2 'hermes-profile-browser-mcp: state directory must remain inside HERMES_HOME'
+    exit 64
+    ;;
+esac
+
+if [[ "${browser_mcp_extension_port}" != <-> ]] ||
+  (( browser_mcp_extension_port < 1024 || browser_mcp_extension_port > 65535 )); then
+  print -u2 'hermes-profile-browser-mcp: extension port must be an unprivileged integer'
+  exit 64
+fi
+
+if [[ "${browser_mcp_connect_timeout}" != <-> ]] ||
+  (( browser_mcp_connect_timeout < 1000 || browser_mcp_connect_timeout > 300000 )); then
+  print -u2 'hermes-profile-browser-mcp: connect timeout must be an integer from 1000 to 300000ms'
+  exit 64
+fi
+
+if [[ "${browser_mcp_profile}" != [A-Za-z0-9]* ||
+  "${browser_mcp_profile}" == *[^A-Za-z0-9._-]* ]]; then
+  print -u2 'hermes-profile-browser-mcp: profile contains unsupported characters'
+  exit 64
+fi
+
+if [[
+  ! -x "${browser_mcp_browser_launcher}"
+  || -L "${browser_mcp_browser_launcher}"
+  || -z "${browser_mcp_node}"
+  || ! -x "${browser_mcp_node}"
+  || ! -f "${browser_mcp_cli}"
+  || -L "${browser_mcp_cli}"
+]]; then
+  print -u2 'hermes-profile-browser-mcp: required launcher, Node.js, or built MCP server is unavailable'
+  exit 69
+fi
+
+/bin/mkdir -p "${browser_mcp_state_dir}"
+if [[ -L "${browser_mcp_state_dir}" || ! -O "${browser_mcp_state_dir}" ]]; then
+  print -u2 'hermes-profile-browser-mcp: state directory must be owner-controlled and physical'
+  exit 73
+fi
+/bin/chmod 700 "${browser_mcp_state_dir}"
+if [[ -L "${browser_mcp_lease_file}" ]]; then
+  print -u2 'hermes-profile-browser-mcp: refusing a symlinked browser lease file'
+  exit 73
+fi
+
+typeset browser_mcp_launch_json
+typeset browser_mcp_lease_id
+typeset -gi browser_mcp_renewal_pid=0
+typeset -gi browser_mcp_server_pid=0
+typeset -gi browser_mcp_cleanup_started=0
+
+browser_mcp_launch_json="$(
+  "${browser_mcp_browser_launcher}" launch "${browser_mcp_task_url}"
+)"
+browser_mcp_launch_json="$(
+  "${browser_mcp_python}" -c \
+    'import json, sys; value = json.load(sys.stdin); value["task_url"] = sys.argv[1]; print(json.dumps(value, separators=(",", ":")))' \
+    "${browser_mcp_task_url}" <<<"${browser_mcp_launch_json}"
+)"
+browser_mcp_lease_id="$(
+  "${browser_mcp_python}" -c \
+    'import json, sys; value = json.load(sys.stdin); print(value.get("lease_id", ""))' \
+    <<<"${browser_mcp_launch_json}"
+)"
+
+if [[ -z "${browser_mcp_lease_id}" ]]; then
+  print -u2 'hermes-profile-browser-mcp: dedicated browser did not return a lease'
+  exit 1
+fi
+
+print -r -- "${browser_mcp_launch_json}" >| "${browser_mcp_lease_file}"
+
+browser_mcp_cleanup() {
+  if (( browser_mcp_cleanup_started > 0 )); then
+    return
+  fi
+  browser_mcp_cleanup_started=1
+  if (( browser_mcp_renewal_pid > 0 )); then
+    # The renewal shell may currently be waiting in /bin/sleep. Terminate that
+    # direct child first so it cannot outlive the wrapper or retain stdio pipes.
+    /usr/bin/pkill -TERM -P "${browser_mcp_renewal_pid}" >/dev/null 2>&1 || true
+    /bin/kill "${browser_mcp_renewal_pid}" >/dev/null 2>&1 || true
+    wait "${browser_mcp_renewal_pid}" >/dev/null 2>&1 || true
+  fi
+  if (( browser_mcp_server_pid > 0 )); then
+    /bin/kill -TERM "${browser_mcp_server_pid}" >/dev/null 2>&1 || true
+  fi
+  /bin/rm -f "${browser_mcp_lease_file}"
+  "${browser_mcp_browser_launcher}" release "${browser_mcp_lease_id}" \
+    >/dev/null 2>&1 || true
+}
+trap browser_mcp_cleanup EXIT
+trap 'browser_mcp_cleanup; exit 130' INT
+trap 'browser_mcp_cleanup; exit 143' TERM
+trap 'browser_mcp_cleanup; exit 129' HUP
+
+(
+  while /bin/sleep 600; do
+    "${browser_mcp_browser_launcher}" renew "${browser_mcp_lease_id}" \
+      >/dev/null 2>&1 || exit 0
+  done
+) &
+browser_mcp_renewal_pid=$!
+
+unset VIBE_REMOTE_URL VIBE_EXTENSION_UUID VIBE_RELAY_UUID VIBE_MCP_PID_FILE
+export BROWSER_MCP_EXTENSION_PORT="${browser_mcp_extension_port}"
+export BROWSER_MCP_PROFILE="${browser_mcp_profile}"
+
+"${browser_mcp_node}" "${browser_mcp_cli}" start \
+  --port "${browser_mcp_extension_port}" \
+  --profile "${browser_mcp_profile}" \
+  --require-extension \
+  --extension-connect-timeout "${browser_mcp_connect_timeout}" <&0 &
+browser_mcp_server_pid=$!
+wait "${browser_mcp_server_pid}"

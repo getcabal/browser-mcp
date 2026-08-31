@@ -125,6 +125,39 @@ Startup order does not matter. The extension retries its loopback connection
 with bounded exponential backoff; handshake rejections (wrong profile or
 protocol) are fatal and stop reconnection until reconfigured.
 
+### Hermes profile adapter
+
+Hermes profiles that previously used `profile-vibe-mcp` need to preserve one
+additional responsibility: that wrapper owns the dedicated browser lease. Use
+`scripts/hermes-profile-browser-mcp` as the MCP command so Browser MCP replaces
+the Vibe process without bypassing browser launch, renewal, or release:
+
+```yaml
+mcp_servers:
+  vibe:  # keep this key to preserve the mcp_vibe_* tool namespace
+    command: /path/to/browser-mcp/scripts/hermes-profile-browser-mcp
+    args: []
+    env:
+      BROWSER_MCP_ROOT: /path/to/browser-mcp
+      BROWSER_MCP_BROWSER_LAUNCHER: /path/to/.hermes/bin/default-browser-native
+      BROWSER_MCP_STATE_DIR: /path/to/.hermes/profiles/default/cache/browser-mcp
+      BROWSER_MCP_EXTENSION_PORT: "21122"
+      BROWSER_MCP_PROFILE: default
+      BROWSER_MCP_CONNECT_TIMEOUT_MS: "90000"
+    connect_timeout: 120.0
+```
+
+The extension artifact must be stamped with the same profile and extension
+port. The old Vibe agent port is intentionally absent: Browser MCP speaks MCP
+directly over stdio and owns only the profile's loopback extension port.
+
+For a staged cutover, install the locked artifact and activate the matching
+Hermes command together. If the extension is loaded while no process owns its
+locked port, Chrome may retain a handled WebSocket connection-refused record at
+the constructor line; that is an inactive route, not a malformed WebSocket.
+Run `doctor` on the artifact, then verify the adapter through an MCP
+`tools/list` call before retiring the old profile route.
+
 ## Browser tools
 
 Every compatible tool also accepts optional `pageStateFormat` with value
@@ -301,7 +334,7 @@ packaged name/port metadata. Modified or stale installs fail closed.
 ## Testing
 
 ```bash
-npm test          # build + all seven suites (below)
+npm test          # build + all eight suites (below)
 npm run test:browser  # just the real-browser suite
 ```
 
@@ -322,7 +355,10 @@ The suite, in order:
    XHR, beacon, or non-loopback WebSocket code exists in any shipped file.
 6. **deployment** — packages locked profile artifacts twice, proves identical
    hashes, and verifies the inert hash-first doctor path.
-7. **browser-e2e** — loads a stamped extension into a real headless Chromium
+7. **hermes-wrapper** — proves the lease-aware adapter launches, records, and
+   releases the dedicated browser; passes the exact locked port/profile to the
+   stdio server; and rejects unsafe configuration.
+8. **browser-e2e** — loads a stamped extension into a real headless Chromium
    and exercises the full 24-tool surface against local test pages, including
    readiness, uids, key chords, uploads, waits, and screenshots.
 
@@ -353,9 +389,10 @@ extension/config.js           Development defaults or locked stamped fleet route
 server/src/contract.ts        Vibe-compatible production contract + validation
 server/src/                   TypeScript MCP server and loopback bridge
 server/test/fixtures/         Independent captured Vibe 0.3.6 tools/list fixture
-server/test/                  Seven test suites (see Testing)
+server/test/                  Eight test suites (see Testing)
 scripts/package-extension.mjs Deterministic zip packager + profile stamping
 scripts/doctor.mjs            Installation and deployment verification
+scripts/hermes-profile-browser-mcp  Lease-aware Hermes MCP command adapter
 scripts/clean.mjs             Removes generated output
 ```
 
@@ -363,7 +400,7 @@ scripts/clean.mjs             Removes generated output
 
 ```bash
 npm run build     # Compile the server
-npm test          # Build + all seven test suites (requires a Chromium binary)
+npm test          # Build + all eight test suites (requires a Chromium binary)
 npm run doctor    # Check environment, versions, contract; --extension-dir verifies a deploy
 npm run package   # Deterministic extension zips; --profile name:port stamps copies
 npm run clean     # Remove server/dist and dist
