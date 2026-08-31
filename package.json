@@ -1,13 +1,16 @@
 {
   "name": "local-browser-mcp-workspace",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
+  "type": "module",
   "description": "A standalone, local-only MCP server and Chrome extension for browser control",
   "workspaces": ["server"],
   "scripts": {
     "build": "npm run build --workspace local-browser-mcp-server",
     "test": "npm run test --workspace local-browser-mcp-server",
+    "test:browser": "npm run test:browser --workspace local-browser-mcp-server",
     "doctor": "node scripts/doctor.mjs",
+    "package": "node scripts/package-extension.mjs",
     "clean": "node scripts/clean.mjs"
   },
   "engines": { "node": ">=18" },

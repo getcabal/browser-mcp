@@ -3,4 +3,5 @@ import { resolve } from 'node:path';
 
 const root = resolve(import.meta.dirname, '..');
 await rm(resolve(root, 'server/dist'), { recursive: true, force: true });
-console.log('Removed server/dist');
+await rm(resolve(root, 'dist'), { recursive: true, force: true });
+console.log('Removed server/dist and dist');
