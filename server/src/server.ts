@@ -23,7 +23,7 @@ export class LocalMcpServer {
 
   constructor(options: ServerOptions = {}) {
     this.requireExtension = options.requireExtension ?? false;
-    this.extensionConnectTimeoutMs = options.extensionConnectTimeoutMs ?? 10_000;
+    this.extensionConnectTimeoutMs = options.extensionConnectTimeoutMs ?? 90_000;
     this.bridge = new LocalExtensionBridge({
       port: options.port,
       debug: options.debug,

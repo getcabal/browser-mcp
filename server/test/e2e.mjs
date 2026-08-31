@@ -35,7 +35,7 @@ const text = (result) => result.content?.[0]?.text ?? '';
   assert.equal(bridge.getTools()[0].name, 'echo');
   const result = await bridge.callTool('echo', { value: 'hi' });
   assert.equal(text(result), 'echo:hi');
-  // A one-tool extension does not satisfy the reviewed contract.
+  // A one-tool extension does not satisfy the Vibe compatibility contract.
   const status = bridge.contractStatus();
   assert.equal(status.ok, false);
   assert.ok(status.problems.includes('missing tool: list_pages'));

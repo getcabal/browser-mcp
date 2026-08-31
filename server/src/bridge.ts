@@ -304,7 +304,7 @@ export class LocalExtensionBridge extends EventEmitter {
   }
 
   /**
-   * Wait until a connected extension advertises the full reviewed contract,
+   * Wait until a connected extension advertises the full Vibe-compatible contract,
    * or the timeout passes. Resolves with the latest validation problems on
    * failure (never rejects).
    */

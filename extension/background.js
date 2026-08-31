@@ -5,10 +5,10 @@
  * reviewed tool contract (extension/tools.js), and executes tool calls with
  * chrome.tabs / chrome.windows / chrome.debugger (CDP 1.3).
  *
- * Connection endpoint and profile identity come from config.js (stamped per
- * fleet profile by the packager) overridden by chrome.storage.local (options
- * page). Handshake mismatches fail closed: the server rejects with close codes
- * 4400/4403/4426 and the worker stops reconnecting until reconfigured.
+ * Connection endpoint and profile identity come from config.js. Fleet builds
+ * are stamped with locked=true and cannot be retargeted through extension
+ * storage or the options page. Development builds may opt into local overrides.
+ * Handshake mismatches fail closed with 4400/4403/4426.
  */
 
 import DEFAULT_CONFIG from './config.js';
@@ -37,12 +37,18 @@ let reconnectTimer = null;
 let heartbeatTimer = null;
 let lastFrameAt = 0;
 let handshakeState = 'idle'; // idle | hello_sent | established
-let activeConfig = { port: DEFAULT_CONFIG.port, profile: DEFAULT_CONFIG.profile };
+let activeConfig = {
+  port: DEFAULT_CONFIG.port,
+  profile: DEFAULT_CONFIG.profile ?? null,
+  locked: DEFAULT_CONFIG.locked === true,
+};
 let fatalMemory = null;
 
 async function resolveConfig() {
   let port = DEFAULT_CONFIG.port;
   let profile = DEFAULT_CONFIG.profile ?? null;
+  const locked = DEFAULT_CONFIG.locked === true;
+  if (locked) return { port, profile, locked };
   try {
     const stored = await chrome.storage.local.get(['port', 'profile']);
     if (Number.isInteger(stored.port) && stored.port >= 1024 && stored.port <= 65535) port = stored.port;
@@ -50,7 +56,7 @@ async function resolveConfig() {
   } catch {
     // storage unavailable; keep stamped defaults
   }
-  return { port, profile };
+  return { port, profile, locked };
 }
 
 async function getFatal() {
@@ -213,7 +219,8 @@ const inFlight = new Map(); // requestId -> Promise
 function toolTimeoutMs(name, args) {
   if (name.startsWith('wait_for')) return waitBudget(args) + 15_000;
   if (name === 'new_page' || name === 'navigate_page' || name === 'switch_to_page') {
-    const budget = typeof args.timeoutMs === 'number' && args.timeoutMs >= 0 ? args.timeoutMs : 15_000;
+    const fallback = name === 'switch_to_page' ? 15_000 : 45_000;
+    const budget = typeof args.timeoutMs === 'number' && args.timeoutMs >= 0 ? args.timeoutMs : fallback;
     return budget + 30_000;
   }
   return DEFAULT_TOOL_TIMEOUT_MS;
@@ -222,6 +229,11 @@ function toolTimeoutMs(name, args) {
 function waitBudget(args) {
   const requested = typeof args?.timeout === 'number' && args.timeout > 0 ? args.timeout : 30_000;
   return Math.min(requested, MAX_WAIT_MS);
+}
+
+function boundedTimeout(args, fallback, maximum = MAX_WAIT_MS) {
+  const requested = typeof args?.timeout === 'number' && Number.isFinite(args.timeout) ? args.timeout : fallback;
+  return Math.max(1, Math.min(requested, maximum));
 }
 
 function withTimeout(promise, ms, label) {
@@ -265,7 +277,7 @@ async function handleCall(message) {
   inFlight.set(requestId, work);
   let response;
   try {
-    const value = await work;
+    const value = await appendRequestedPageState(name, args, await work);
     response = { type: 'tool_result', requestId, result: toResult(value) };
   } catch (error) {
     response = {
@@ -373,6 +385,20 @@ async function activeTabId(args) {
   throw new Error('No active tab');
 }
 
+function requirePageId(args, toolName) {
+  if (typeof args?.pageId !== 'number' || !Number.isFinite(args.pageId)) {
+    throw new Error(`${toolName} requires pageId`);
+  }
+  return args.pageId;
+}
+
+function requireTabId(args, toolName) {
+  if (typeof args?.tabId !== 'number' || !Number.isFinite(args.tabId)) {
+    throw new Error(`${toolName} requires tabId`);
+  }
+  return args.tabId;
+}
+
 async function pageLines(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -384,19 +410,17 @@ async function pageLines(tabId) {
 
 /**
  * Bounded readiness: poll tab.status until 'complete'. A timeout degrades to
- * success with a warning suffix — never an error (established behavior).
+ * a warning, but a closed/replaced target fails instead of reporting success.
  */
 async function waitForReady(tabId, timeoutMs = 15_000) {
   const budget = Math.max(0, typeof timeoutMs === 'number' ? timeoutMs : 15_000);
   const deadline = Date.now() + budget;
   await sleep(Math.min(150, budget));
   while (Date.now() < deadline) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab.status === 'complete') return '';
-    } catch {
-      return ''; // tab closed or replaced; nothing left to wait for
-    }
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); }
+    catch { throw new Error(`Page ${tabId} closed while waiting for readiness`); }
+    if (tab.status === 'complete') return '';
     await sleep(150);
   }
   const seconds = Math.round(budget / 1000);
@@ -441,6 +465,7 @@ async function pollUntil(probe, { timeoutMs, intervalMs = 250, describe }) {
 // ---------------------------------------------------------------------------
 
 const snapshots = new Map(); // tabId -> Map(uid -> { backendNodeId, role, name })
+const snapshotHashes = new Map(); // `${tabId}:${format}` -> content hash
 
 const INTERACTIVE_ROLES = new Set([
   'button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio', 'combobox',
@@ -450,40 +475,120 @@ const INTERACTIVE_ROLES = new Set([
 
 const SKIPPED_ROLES = new Set(['none', 'generic', 'InlineTextBox', 'LineBreak']);
 
-async function takeSnapshotFor(tabId, interactiveOnly) {
-  const { nodes } = await cdp(tabId, 'Accessibility.getFullAXTree', {});
+async function accessibilityNodes(tabId, { maxDepth, scopeSelector } = {}) {
+  if (scopeSelector) {
+    const { root } = await cdp(tabId, 'DOM.getDocument', { depth: 0 });
+    const { nodeId } = await cdp(tabId, 'DOM.querySelector', { nodeId: root.nodeId, selector: scopeSelector });
+    if (!nodeId) throw new Error(`scopeSelector matched no element: ${scopeSelector}`);
+    const { node } = await cdp(tabId, 'DOM.describeNode', { nodeId });
+    return (await cdp(tabId, 'Accessibility.getPartialAXTree', {
+      backendNodeId: node.backendNodeId,
+      fetchRelatives: true,
+    })).nodes || [];
+  }
+  const params = {};
+  if (typeof maxDepth === 'number' && Number.isFinite(maxDepth) && maxDepth > 0) {
+    params.depth = Math.floor(maxDepth);
+  }
+  return (await cdp(tabId, 'Accessibility.getFullAXTree', params)).nodes || [];
+}
+
+function hashText(text) {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+async function takeSnapshotFor(tabId, options = {}) {
+  const format = options.format || 'markdown';
+  if (!['markdown', 'accessibility_tree', 'aria'].includes(format)) {
+    throw new Error(`Unknown snapshot format: ${format}`);
+  }
+  const nodes = await accessibilityNodes(tabId, options);
+  const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+  const depthFor = (node) => {
+    let depth = 0;
+    let cursor = node;
+    const seen = new Set();
+    while (cursor?.parentId && byId.has(cursor.parentId) && !seen.has(cursor.parentId)) {
+      seen.add(cursor.parentId);
+      cursor = byId.get(cursor.parentId);
+      depth += 1;
+    }
+    return depth;
+  };
   const refs = new Map();
   const lines = [];
   let counter = 0;
   let omitted = 0;
-  for (const node of nodes || []) {
+  for (const node of nodes) {
     if (node.ignored) continue;
     const role = node.role?.value || '';
     const name = node.name?.value || '';
     if (!role || SKIPPED_ROLES.has(role)) continue;
     const interactive = INTERACTIVE_ROLES.has(role.toLowerCase());
-    if (!name && !interactive) continue;
-    if (interactiveOnly && !interactive) continue;
+    if (options.compact === true && !name && !interactive) continue;
+    if (!name && !interactive && format === 'markdown') continue;
     if (typeof node.backendDOMNodeId !== 'number') continue;
     counter += 1;
     const uid = `@e${counter}`;
     refs.set(uid, { backendNodeId: node.backendDOMNodeId, role, name });
     if (lines.length < MAX_SNAPSHOT_LINES) {
-      lines.push(`${uid} [${role}] ${JSON.stringify(name)}`);
+      const depth = depthFor(node);
+      if (format === 'markdown') lines.push(`${uid} [${role}] ${JSON.stringify(name)}`);
+      else if (format === 'aria') lines.push(`${'  '.repeat(depth)}${role} ${JSON.stringify(name)} [uid=${uid}]`);
+      else lines.push(`${'  '.repeat(depth)}${uid} role=${JSON.stringify(role)} name=${JSON.stringify(name)}`);
     } else {
       omitted += 1;
     }
   }
   snapshots.set(tabId, refs);
-  if (omitted > 0) lines.push(`... (${omitted} more node(s) omitted; use interactive: true to narrow)`);
-  return `${await pageLines(tabId)}\n${lines.join('\n')}`;
+  if (omitted > 0) lines.push(`... (${omitted} more node(s) omitted; use compact/maxDepth/scopeSelector to narrow)`);
+  const body = lines.join('\n');
+  const hash = hashText(body);
+  const hashKey = `${tabId}:${format}`;
+  const previous = snapshotHashes.get(hashKey);
+  snapshotHashes.set(hashKey, hash);
+  const header = `${await pageLines(tabId)}\nFormat: ${format}\nPage changed: ${previous === undefined || previous !== hash}`;
+  if (options.changedOnly === true && previous === hash) {
+    return `${header}\nSnapshot unchanged (${hash})`;
+  }
+  return `${header}\n${body}`;
+}
+
+async function pageStateTarget(name, args, value) {
+  if (name === 'close_page') return activeTabId({});
+  if (typeof args.pageId === 'number') return args.pageId;
+  if (typeof args.tabId === 'number') return args.tabId;
+  if (name === 'new_page' && typeof value === 'string') {
+    const match = value.match(/Tab ID: (\d+)/);
+    if (match) return Number(match[1]);
+  }
+  return activeTabId({});
+}
+
+async function appendRequestedPageState(name, args, value) {
+  const format = args?.pageStateFormat;
+  if (format === undefined || format === null) return value;
+  if (format !== 'markdown' && format !== 'accessibility_tree') {
+    throw new Error('pageStateFormat must be "markdown" or "accessibility_tree"');
+  }
+  const tabId = await pageStateTarget(name, args, value);
+  const state = await takeSnapshotFor(tabId, { format });
+  const result = toResult(value);
+  result.content.push({ type: 'text', text: `Page state (${format}) for tab ${tabId}:\n${state}` });
+  return result;
 }
 
 function normalizeUid(raw) {
   const text = String(raw ?? '').trim();
   const stripped = text.startsWith('@') ? text.slice(1) : text;
-  if (!/^e\d+$/.test(stripped)) throw new Error(`Invalid uid: ${text || '(empty)'}; expected an @eN uid from take_snapshot`);
-  return `@${stripped}`;
+  const normalized = /^\d+$/.test(stripped) ? `e${stripped}` : stripped;
+  if (!/^e\d+$/.test(normalized)) throw new Error(`Invalid uid: ${text || '(empty)'}; expected an @eN uid or numeric index from take_snapshot`);
+  return `@${normalized}`;
 }
 
 async function relocate(tabId, entry) {
@@ -527,6 +632,29 @@ async function elementCenter(tabId, backendNodeId) {
     x: (Math.min(...xs) + Math.max(...xs)) / 2,
     y: (Math.min(...ys) + Math.max(...ys)) / 2,
   };
+}
+
+async function selectorBackendNodeId(tabId, selector) {
+  const { root } = await cdp(tabId, 'DOM.getDocument', { depth: 0 });
+  const { nodeId } = await cdp(tabId, 'DOM.querySelector', { nodeId: root.nodeId, selector });
+  if (!nodeId) throw new Error(`Selector matched no element: ${selector}`);
+  const { node } = await cdp(tabId, 'DOM.describeNode', { nodeId });
+  return node.backendNodeId;
+}
+
+async function pointForTarget(tabId, target, label) {
+  if (target && typeof target === 'object') {
+    const x = Number(target.x);
+    const y = Number(target.y);
+    if (Number.isFinite(x) && Number.isFinite(y)) return { x, y };
+  }
+  if (typeof target === 'number' || /^(?:@?e)?\d+$/.test(String(target ?? '').trim())) {
+    return elementCenter(tabId, await resolveUid(tabId, target));
+  }
+  if (typeof target === 'string' && target.trim()) {
+    return elementCenter(tabId, await selectorBackendNodeId(tabId, target.trim()));
+  }
+  throw new Error(`${label} must be a selector, snapshot uid/index, or {x, y} coordinates`);
 }
 
 // ---------------------------------------------------------------------------
@@ -684,48 +812,19 @@ async function setElementValue(tabId, backendNodeId, value) {
   await callOnElement(tabId, backendNodeId, SET_VALUE_FN, [value]);
 }
 
-async function dispatchClick(tabId, point, dblClick) {
-  const base = { x: point.x, y: point.y, button: 'left', pointerType: 'mouse' };
+async function dispatchClick(tabId, point, modifiers = 0) {
+  const base = { x: point.x, y: point.y, button: 'left', pointerType: 'mouse', modifiers };
   await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved', button: 'none', buttons: 0 });
-  const clicks = dblClick ? 2 : 1;
-  for (let count = 1; count <= clicks; count += 1) {
-    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1, clickCount: count });
-    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0, clickCount: count });
-  }
+  await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1, clickCount: 1 });
+  await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0, clickCount: 1 });
 }
-
-// ---------------------------------------------------------------------------
-// Network idle tracking
-// ---------------------------------------------------------------------------
-
-const networkState = new Map(); // tabId -> { inflight: Set<requestId> }
-
-function networkStateFor(tabId) {
-  let state = networkState.get(tabId);
-  if (!state) {
-    state = { inflight: new Set() };
-    networkState.set(tabId, state);
-  }
-  return state;
-}
-
-chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (typeof source.tabId !== 'number' || !params) return;
-  const state = networkStateFor(source.tabId);
-  if (method === 'Network.requestWillBeSent') {
-    if (params.type === 'WebSocket' || params.type === 'EventSource') return;
-    state.inflight.add(params.requestId);
-  } else if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
-    state.inflight.delete(params.requestId);
-  }
-});
 
 chrome.debugger.onDetach.addListener((source) => {
   if (typeof source.tabId === 'number') attached.delete(source.tabId);
 });
 
 // ---------------------------------------------------------------------------
-// Executors — the reviewed contract plus local extras
+// Executors — the Vibe compatibility contract plus local extras
 // ---------------------------------------------------------------------------
 
 const CALLABLE_PATTERNS = [
@@ -741,75 +840,92 @@ const jsonText = (value) => (value === undefined ? 'undefined' : typeof value ==
 const executors = {
   async list_pages() {
     const tabs = await chrome.tabs.query({});
-    let focused = null;
-    try { focused = await chrome.windows.getLastFocused({}); } catch { /* no window focus info */ }
-    tabs.sort((a, b) => (a.windowId - b.windowId) || (a.index - b.index));
+    tabs.sort((a, b) => (a.id || 0) - (b.id || 0));
     const lines = tabs.map((tab) => {
-      const active = tab.active && (!focused || tab.windowId === focused.id) ? ' [ACTIVE]' : '';
+      const active = tab.active ? ' [ACTIVE]' : '';
       return `Page ${tab.id}${active}: "${tab.title || ''}" - ${tab.url || tab.pendingUrl || ''}`;
     });
     return [`Found ${tabs.length} page(s):`, ...lines].join('\n');
   },
 
   async new_page(args) {
-    const url = allowedUrl(args.url);
-    const tab = await chrome.tabs.create({ url, active: true });
+    const url = args.url === undefined || args.url === null || args.url === '' ? 'about:blank' : allowedUrl(args.url);
+    const focus = args.focus === true;
+    const tab = await chrome.tabs.create({ url, active: focus });
     let warning = '';
-    if (args.waitForReady !== false) warning = await waitForReady(tab.id, args.timeoutMs ?? 15_000);
-    return `Opened new page${warning}\n${await pageLines(tab.id)}`;
+    if (args.waitForReady !== false && url !== 'about:blank') warning = await waitForReady(tab.id, 45_000);
+    return `Opened new ${focus ? 'foreground' : 'background'} page${warning}\n${await pageLines(tab.id)}`;
   },
 
   async close_page(args) {
-    const tabId = await activeTabId(args);
-    await chrome.tabs.remove(tabId);
-    return `Closed tab ${tabId}`;
+    const pageId = requirePageId(args, 'close_page');
+    await chrome.tabs.get(pageId);
+    const tabs = await chrome.tabs.query({});
+    if (tabs.length <= 1) throw new Error('Refusing to close the final remaining page');
+    await chrome.tabs.remove(pageId);
+    return `Closed page ${pageId}`;
   },
 
   async navigate_page(args) {
-    const tabId = await activeTabId(args);
-    const type = args.type || 'url';
-    if (type === 'url') await chrome.tabs.update(tabId, { url: allowedUrl(args.url) });
-    else if (type === 'back') await chrome.tabs.goBack(tabId);
-    else if (type === 'forward') await chrome.tabs.goForward(tabId);
-    else if (type === 'reload') await chrome.tabs.reload(tabId);
+    const pageId = requirePageId(args, 'navigate_page');
+    const type = args.type;
+    if (type === 'url') await chrome.tabs.update(pageId, { url: allowedUrl(args.url) });
+    else if (type === 'back') await chrome.tabs.goBack(pageId);
+    else if (type === 'forward') await chrome.tabs.goForward(pageId);
+    else if (type === 'reload') await chrome.tabs.reload(pageId);
     else throw new Error(`Unknown navigation type: ${type}`);
-    const warning = await waitForReady(tabId, args.timeoutMs ?? 15_000);
-    return `Navigated (${type})${warning}\n${await pageLines(tabId)}`;
+    const warning = await waitForReady(pageId, args.timeoutMs ?? 45_000);
+    return `Navigated page ${pageId} (${type})${warning}\n${await pageLines(pageId)}`;
   },
 
   async switch_to_page(args) {
-    if (typeof args.tabId !== 'number') throw new Error('switch_to_page requires tabId');
-    const tab = await chrome.tabs.update(args.tabId, { active: true });
+    const pageId = requirePageId(args, 'switch_to_page');
+    const target = await chrome.tabs.get(pageId);
+    try { await chrome.windows.update(target.windowId, { focused: true }); } catch { /* headless focus is unavailable */ }
+    const tab = await chrome.tabs.update(pageId, { active: true });
     try { await chrome.windows.update(tab.windowId, { focused: true }); } catch { /* headless or gone */ }
-    let warning = await waitForReady(args.tabId, 15_000);
-    if (!warning) {
-      const visible = await pollVisibility(args.tabId, 3_000);
+    let warning = '';
+    if (args.waitForReady !== false) warning = await waitForReady(pageId, 15_000);
+    if (args.waitForReady !== false && !warning) {
+      const visible = await pollVisibility(pageId, 3_000);
       if (!visible) warning = ' (page did not report visibilityState=visible within 3s)';
     }
-    return `Switched to tab ${args.tabId}${warning}\n${await pageLines(args.tabId)}`;
+    return `Switched to page ${pageId}${warning}\n${await pageLines(pageId)}`;
   },
 
   async take_snapshot(args) {
-    const tabId = await activeTabId(args);
-    return takeSnapshotFor(tabId, args.interactive === true);
+    const tabId = typeof args.pageId === 'number' ? args.pageId : await activeTabId(args);
+    return takeSnapshotFor(tabId, {
+      format: args.format ?? 'markdown',
+      compact: args.compact === true,
+      maxDepth: args.maxDepth,
+      scopeSelector: args.scopeSelector,
+      changedOnly: args.changedOnly === true,
+    });
   },
 
   async click(args) {
-    const tabId = await activeTabId(args);
+    const tabId = requireTabId(args, 'click');
     const target = await resolveUid(tabId, args.uid);
+    if (args.openInNewTab === true) {
+      const href = await callOnElement(tabId, target, 'function(){ const link = this.closest ? this.closest("a[href]") : null; return (link || this).href || null; }');
+      if (typeof href === 'string' && href) {
+        const opened = await chrome.tabs.create({ url: allowedUrl(href), active: false });
+        return `Clicked ${normalizeUid(args.uid)} and opened tab ${opened.id}`;
+      }
+    }
     try {
       const point = await elementCenter(tabId, target);
-      await dispatchClick(tabId, point, args.dblClick === true);
+      await dispatchClick(tabId, point, args.openInNewTab === true ? 4 : 0);
     } catch {
       // No box model (hidden/zero-size element): fall back to a DOM click.
       await callOnElement(tabId, target, 'function(){ this.click(); }');
-      if (args.dblClick === true) await callOnElement(tabId, target, 'function(){ this.click(); }');
     }
     return `Clicked ${normalizeUid(args.uid)}`;
   },
 
   async fill(args) {
-    const tabId = await activeTabId(args);
+    const tabId = requireTabId(args, 'fill');
     if (typeof args.value !== 'string') throw new Error('fill requires a string value');
     const target = await resolveUid(tabId, args.uid);
     await setElementValue(tabId, target, args.value);
@@ -817,7 +933,7 @@ const executors = {
   },
 
   async fill_form(args) {
-    const tabId = await activeTabId(args);
+    const tabId = requireTabId(args, 'fill_form');
     const elements = Array.isArray(args.elements) ? args.elements : [];
     if (!elements.length) throw new Error('fill_form requires a non-empty elements array');
     const done = [];
@@ -835,166 +951,169 @@ const executors = {
   },
 
   async type_text(args) {
-    const tabId = await activeTabId(args);
+    const tabId = requireTabId(args, 'type_text');
     if (typeof args.text !== 'string') throw new Error('type_text requires text');
-    if (args.uid) {
-      const target = await resolveUid(tabId, args.uid);
-      await callOnElement(tabId, target, `function() {
-        this.focus();
-        if (typeof this.setSelectionRange === 'function' && /^(text|search|tel|url|password)$/i.test(this.type || 'text')) {
-          const end = this.value.length;
-          try { this.setSelectionRange(end, end); } catch { /* unsupported input type */ }
-        }
-      }`);
-    }
     for (const char of args.text) await dispatchKey(tabId, keyForChar(char));
     if (args.submitKey) await dispatchChord(tabId, args.submitKey);
     return `Typed ${JSON.stringify(args.text)}${args.submitKey ? ` and pressed ${args.submitKey}` : ''}`;
   },
 
   async wait_for(args) {
-    const tabId = await activeTabId(args);
-    const texts = (Array.isArray(args.text) ? args.text : [args.text])
+    const tabId = requireTabId(args, 'wait_for');
+    const texts = (Array.isArray(args.text) ? args.text : [])
       .map((entry) => String(entry ?? ''))
       .filter((entry) => entry.length > 0);
-    if (!texts.length) throw new Error('wait_for requires text');
-    const timeoutMs = waitBudget(args);
+    if (!texts.length) throw new Error('wait_for requires a non-empty text array');
+    const timeoutMs = boundedTimeout(args, 10_000, 60_000);
     const label = texts.map((entry) => JSON.stringify(entry)).join(', ');
     await pollUntil(async () => {
       const pageText = await evaluateInPage(tabId, 'document.body ? document.body.innerText : ""');
-      return typeof pageText === 'string' && texts.every((entry) => pageText.includes(entry));
-    }, { timeoutMs, describe: `text ${label}` });
-    return `Found ${label}`;
+      return typeof pageText === 'string' && texts.some((entry) => pageText.includes(entry));
+    }, { timeoutMs, describe: `any text in ${label}` });
+    return `Found at least one of: ${label}`;
   },
 
   async wait_for_url(args) {
     const tabId = await activeTabId(args);
-    const pattern = String(args.url ?? '');
-    if (!pattern) throw new Error('wait_for_url requires url');
-    let regex = null;
-    try { regex = new RegExp(pattern); } catch { regex = null; }
-    const timeoutMs = waitBudget(args);
+    const pattern = String(args.pattern ?? '');
+    if (!pattern) throw new Error('wait_for_url requires pattern');
+    const hasGlob = /[*?]/.test(pattern);
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+    const regex = hasGlob ? new RegExp(`^${escaped}$`) : null;
+    const timeoutMs = boundedTimeout(args, 15_000, 60_000);
     const finalUrl = await pollUntil(async () => {
       const tab = await chrome.tabs.get(tabId);
       const url = tab.url || tab.pendingUrl || '';
-      if (url.includes(pattern)) return url;
-      if (regex && regex.test(url)) return url;
+      if (regex ? regex.test(url) : url.includes(pattern)) return url;
       return null;
-    }, { timeoutMs, describe: `URL matching ${JSON.stringify(pattern)}` });
+    }, { timeoutMs, describe: `URL pattern ${JSON.stringify(pattern)}` });
     return `URL is now ${finalUrl}`;
   },
 
   async wait_for_network_idle(args) {
     const tabId = await activeTabId(args);
-    const idleMs = typeof args.idleMs === 'number' && args.idleMs > 0 ? Math.min(args.idleMs, 60_000) : 500;
-    const timeoutMs = waitBudget(args);
-    await cdp(tabId, 'Network.enable', {});
-    const state = networkStateFor(tabId);
-    const deadline = Date.now() + timeoutMs;
-    let idleStart = state.inflight.size === 0 ? Date.now() : null;
-    for (;;) {
-      if (state.inflight.size === 0) {
-        if (idleStart === null) idleStart = Date.now();
-        if (Date.now() - idleStart >= idleMs) return `Network idle for ${idleMs}ms`;
-      } else {
-        idleStart = null;
+    const idleMs = typeof args.idleMs === 'number' && args.idleMs > 0 ? Math.min(args.idleMs, 30_000) : 800;
+    const timeoutMs = boundedTimeout(args, 10_000, 30_000);
+    const expression = `(() => {
+      if (!window.__localMcpDomQuiet) {
+        const state = { lastMutation: Date.now() };
+        state.observer = new MutationObserver(() => { state.lastMutation = Date.now(); });
+        state.observer.observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true });
+        window.__localMcpDomQuiet = state;
       }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out after ${timeoutMs}ms waiting for network idle (${state.inflight.size} request(s) in flight)`);
-      }
-      await sleep(100);
-    }
+      return document.readyState === 'complete' && Date.now() - window.__localMcpDomQuiet.lastMutation >= ${idleMs};
+    })()`;
+    await pollUntil(async () => evaluateInPage(tabId, expression), {
+      timeoutMs,
+      intervalMs: Math.min(250, Math.max(50, Math.floor(idleMs / 4))),
+      describe: `${idleMs}ms of DOM quiet after document readiness`,
+    });
+    return `Document ready and DOM quiet for ${idleMs}ms`;
   },
 
   async wait_for_condition(args) {
     const tabId = await activeTabId(args);
-    const condition = String(args.condition ?? '');
-    if (!condition.trim()) throw new Error('wait_for_condition requires condition');
-    const timeoutMs = waitBudget(args);
+    const expression = String(args.expression ?? '');
+    if (!expression.trim()) throw new Error('wait_for_condition requires expression');
+    const timeoutMs = boundedTimeout(args, 15_000, 60_000);
+    const pollMs = typeof args.pollMs === 'number' && args.pollMs > 0 ? Math.min(args.pollMs, 10_000) : 250;
     await pollUntil(async () => {
-      const value = await evaluateInPage(tabId, `!!(${condition})`);
+      const value = await evaluateInPage(tabId, `!!(${expression})`);
       return value === true;
-    }, { timeoutMs, describe: `condition ${JSON.stringify(condition)}` });
-    return `Condition is truthy: ${condition}`;
+    }, { timeoutMs, intervalMs: pollMs, describe: `condition ${JSON.stringify(expression)}` });
+    return `Condition is truthy: ${expression}`;
   },
 
   async scroll_page(args) {
-    const tabId = await activeTabId(args);
-    const direction = args.direction || 'down';
-    const amount = typeof args.amount === 'number' && Number.isFinite(args.amount) && args.amount > 0 ? args.amount : 500;
-    const deltas = { up: [0, -amount], down: [0, amount], left: [-amount, 0], right: [amount, 0] };
-    const delta = deltas[direction];
-    if (!delta) throw new Error(`Unknown scroll direction: ${direction}`);
-    if (args.uid) {
-      const target = await resolveUid(tabId, args.uid);
-      await callOnElement(tabId, target, 'function(dx, dy){ this.scrollBy({ left: dx, top: dy, behavior: "instant" }); }', delta);
-    } else {
-      await evaluateInPage(tabId, `window.scrollBy({ left: ${delta[0]}, top: ${delta[1]}, behavior: 'instant' })`);
-    }
-    return `Scrolled ${direction} ${amount}px`;
+    const tabId = requireTabId(args, 'scroll_page');
+    const direction = args.direction;
+    if (direction !== 'up' && direction !== 'down') throw new Error('scroll_page direction must be up or down');
+    const numPages = Number(args.numPages);
+    if (!Number.isFinite(numPages) || numPages <= 0) throw new Error('scroll_page requires a positive numPages');
+    await evaluateInPage(tabId, `window.scrollBy({ top: window.innerHeight * ${direction === 'up' ? -numPages : numPages}, behavior: 'instant' })`);
+    return `Scrolled ${direction} ${numPages} page(s)`;
   },
 
   async press_key(args) {
-    const tabId = await activeTabId(args);
+    const tabId = requireTabId(args, 'press_key');
     if (typeof args.keys !== 'string' || !args.keys.length) throw new Error('press_key requires keys');
+    if (typeof args.index === 'number') {
+      const target = await resolveUid(tabId, args.index);
+      await callOnElement(tabId, target, 'function(){ this.focus(); }');
+    }
     await dispatchChord(tabId, args.keys);
     return `Pressed ${args.keys}`;
   },
 
   async hover(args) {
-    const tabId = await activeTabId(args);
-    const target = await resolveUid(tabId, args.uid);
+    const tabId = requireTabId(args, 'hover');
+    const target = await resolveUid(tabId, args.index);
     const point = await elementCenter(tabId, target);
     await cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons: 0, pointerType: 'mouse' });
-    return `Hovered ${normalizeUid(args.uid)}`;
+    const duration = typeof args.duration === 'number' ? Math.max(100, Math.min(args.duration, 5_000)) : 1_000;
+    await sleep(duration);
+    return `Hovered ${normalizeUid(args.index)} for ${duration}ms`;
   },
 
   async drag(args) {
-    const tabId = await activeTabId(args);
-    const sourceNode = await resolveUid(tabId, args.from_uid);
-    const targetNode = await resolveUid(tabId, args.to_uid);
-    const from = await elementCenter(tabId, sourceNode);
-    const to = await elementCenter(tabId, targetNode);
+    const tabId = requireTabId(args, 'drag');
+    const from = await pointForTarget(tabId, args.source, 'source');
+    const to = await pointForTarget(tabId, args.target, 'target');
+    const duration = typeof args.duration === 'number' ? Math.max(50, Math.min(args.duration, 10_000)) : 500;
     const base = { button: 'left', pointerType: 'mouse' };
     await cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y, button: 'none', buttons: 0, pointerType: 'mouse' });
     await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed', x: from.x, y: from.y, buttons: 1, clickCount: 1 });
-    const steps = 8;
+    const steps = Math.max(4, Math.min(60, Math.ceil(duration / 40)));
     for (let step = 1; step <= steps; step += 1) {
       const x = from.x + ((to.x - from.x) * step) / steps;
       const y = from.y + ((to.y - from.y) * step) / steps;
       await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved', x, y, buttons: 1 });
-      await sleep(20);
+      await sleep(duration / steps);
     }
     await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', x: to.x, y: to.y, buttons: 0, clickCount: 1 });
-    return `Dragged ${normalizeUid(args.from_uid)} to ${normalizeUid(args.to_uid)}`;
+    return `Dragged source to target over ${duration}ms`;
   },
 
   async take_screenshot(args) {
-    const tabId = await activeTabId(args);
-    const params = { format: 'png' };
-    if (args.uid) {
-      const target = await resolveUid(tabId, args.uid);
-      const metrics = await cdp(tabId, 'Page.getLayoutMetrics', {});
-      const viewport = metrics.cssLayoutViewport || metrics.layoutViewport || { pageX: 0, pageY: 0 };
-      const { model } = await cdp(tabId, 'DOM.getBoxModel', { backendNodeId: target });
-      const xs = [model.border[0], model.border[2], model.border[4], model.border[6]];
-      const ys = [model.border[1], model.border[3], model.border[5], model.border[7]];
-      params.clip = {
-        x: Math.min(...xs) + (viewport.pageX || 0),
-        y: Math.min(...ys) + (viewport.pageY || 0),
-        width: Math.max(1, Math.max(...xs) - Math.min(...xs)),
-        height: Math.max(1, Math.max(...ys) - Math.min(...ys)),
-        scale: 1,
-      };
-      params.captureBeyondViewport = true;
-    } else if (args.fullPage === true) {
-      const metrics = await cdp(tabId, 'Page.getLayoutMetrics', {});
-      const size = metrics.cssContentSize || metrics.contentSize;
-      params.clip = { x: 0, y: 0, width: Math.ceil(size.width), height: Math.min(Math.ceil(size.height), 16_000), scale: 1 };
-      params.captureBeyondViewport = true;
+    const tabId = requireTabId(args, 'take_screenshot');
+    const quality = typeof args.quality === 'number' ? Math.max(10, Math.min(90, Math.round(args.quality))) : 70;
+    const maxWidth = typeof args.maxWidth === 'number' ? Math.max(64, Math.min(8_192, Math.round(args.maxWidth))) : 1_024;
+    const detail = args.detail === 'high' ? 'high' : 'low';
+    const tab = await chrome.tabs.get(tabId);
+    if (!/^https?:/i.test(tab.url || '')) throw new Error(`Cannot capture restricted/system page: ${tab.url || '(no URL)'}`);
+    const metrics = await cdp(tabId, 'Page.getLayoutMetrics', {});
+    const viewport = metrics.cssVisualViewport || metrics.cssLayoutViewport || metrics.layoutViewport;
+    const width = Math.max(1, Math.ceil(viewport.clientWidth || viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.clientHeight || viewport.height));
+    const scale = detail === 'low'
+      ? Math.min(1, 768 / Math.min(width, height))
+      : Math.min(1, maxWidth / width);
+    const format = quality >= 90 ? 'png' : 'jpeg';
+    const params = {
+      format,
+      ...(format === 'jpeg' ? { quality } : {}),
+      captureBeyondViewport: false,
+      clip: {
+        x: viewport.pageX || 0,
+        y: viewport.pageY || 0,
+        width,
+        height,
+        scale,
+      },
+    };
+    const grayscale = args.grayscale === true;
+    if (grayscale) {
+      await evaluateInPage(tabId, `(() => { const old = document.getElementById('__local_mcp_grayscale'); if (old) old.remove(); const style = document.createElement('style'); style.id = '__local_mcp_grayscale'; style.textContent = 'html { filter: grayscale(1) !important; }'; (document.head || document.documentElement).appendChild(style); })()`);
+      await sleep(50);
     }
-    const { data } = await cdp(tabId, 'Page.captureScreenshot', params);
-    return { content: [{ type: 'image', data, mimeType: 'image/png' }] };
+    try {
+      const { data } = await cdp(tabId, 'Page.captureScreenshot', params);
+      return { content: [{ type: 'image', data, mimeType: `image/${format}` }] };
+    } finally {
+      if (grayscale) {
+        await evaluateInPage(tabId, `document.getElementById('__local_mcp_grayscale')?.remove()`).catch(() => {});
+      }
+    }
   },
 
   async evaluate_script(args) {
@@ -1014,18 +1133,15 @@ const executors = {
   },
 
   async upload_file(args) {
-    const tabId = await activeTabId(args);
+    const tabId = requireTabId(args, 'upload_file');
     const target = await resolveUid(tabId, args.uid);
-    const hasPath = typeof args.filePath === 'string' && args.filePath.length > 0;
-    const hasInline = Boolean(args.file) && typeof args.file === 'object';
-    if (hasPath === hasInline) throw new Error('upload_file requires exactly one of filePath or file');
-    if (hasPath) {
-      await cdp(tabId, 'DOM.setFileInputFiles', { files: [args.filePath], backendNodeId: target });
-      return `Set file input ${normalizeUid(args.uid)} to ${args.filePath}`;
-    }
-    const { filename, mimeType, contentBase64 } = args.file;
-    if (typeof filename !== 'string' || typeof mimeType !== 'string' || typeof contentBase64 !== 'string') {
-      throw new Error('upload_file file requires filename, mimeType, and contentBase64');
+    if ('filePath' in args) throw new Error('upload_file does not accept host filesystem paths; provide inline base64 content');
+    const nested = args.file && typeof args.file === 'object' ? args.file : {};
+    const filename = nested.filename ?? args.filename;
+    const mimeType = nested.mimeType ?? args.mimeType;
+    const contentBase64 = nested.contentBase64 ?? nested.content ?? args.contentBase64 ?? args.content;
+    if (typeof filename !== 'string' || !filename || typeof mimeType !== 'string' || !mimeType || typeof contentBase64 !== 'string' || !contentBase64) {
+      throw new Error('upload_file requires filename, mimeType, and contentBase64/content at the top level or in file');
     }
     await callOnElement(tabId, target, `function(filename, mimeType, contentBase64) {
       const binary = atob(contentBase64);
@@ -1042,17 +1158,18 @@ const executors = {
   },
 
   async resize_page(args) {
-    const tabId = await activeTabId(args);
+    const tabId = requireTabId(args, 'resize_page');
     const width = Math.round(Number(args.width));
     const height = Math.round(Number(args.height));
     if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
       throw new Error('resize_page requires positive width and height');
     }
-    await cdp(tabId, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 0, mobile: false });
-    return `Resized viewport to ${width}x${height}`;
+    const deviceScaleFactor = typeof args.deviceScaleFactor === 'number' && args.deviceScaleFactor > 0 ? args.deviceScaleFactor : 1;
+    await cdp(tabId, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor, mobile: false });
+    return `Resized viewport to ${width}x${height} at device scale ${deviceScaleFactor}`;
   },
 
-  // Local extras beyond the reviewed contract.
+  // Local extras beyond the Vibe compatibility contract.
   async get_text(args) {
     const tabId = await activeTabId(args);
     const value = await evaluateInPage(tabId, 'document.body ? document.body.innerText : ""');
@@ -1075,19 +1192,19 @@ const executors = {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading') {
     snapshots.delete(tabId);
-    const state = networkState.get(tabId);
-    if (state) state.inflight.clear();
+    for (const key of snapshotHashes.keys()) if (key.startsWith(`${tabId}:`)) snapshotHashes.delete(key);
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   snapshots.delete(tabId);
-  networkState.delete(tabId);
+  for (const key of snapshotHashes.keys()) if (key.startsWith(`${tabId}:`)) snapshotHashes.delete(key);
   attached.delete(tabId);
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
+  if (DEFAULT_CONFIG.locked === true) return;
   if ('port' in changes || 'profile' in changes) {
     void (async () => {
       await clearFatal();
@@ -1105,6 +1222,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         connected: Boolean(socket && socket.readyState === WebSocket.OPEN && handshakeState === 'established'),
         port: activeConfig.port,
         profile: activeConfig.profile ?? null,
+        locked: activeConfig.locked === true,
         fatal: await getFatal(),
         version: chrome.runtime.getManifest().version,
       });

@@ -80,6 +80,11 @@ if (!chromeBin) {
   console.error('  Install Google Chrome or Chromium, or set CHROME_BIN=/path/to/chrome and rerun.');
   process.exit(1);
 }
+if (!process.env.CHROME_BIN && /\/Applications\/Google Chrome(?: Canary)?\.app\//.test(chromeBin)) {
+  console.error(`browser-e2e: FAIL — only branded Chrome was found at ${chromeBin}.`);
+  console.error('  Current branded Chrome releases ignore --load-extension; use Chrome for Testing/Chromium or set CHROME_BIN explicitly.');
+  process.exit(1);
+}
 
 // --- Test pages ------------------------------------------------------------
 
@@ -237,7 +242,7 @@ try {
   assert.equal(bridge.getTools().length, 24, 'extension advertises 24 tools');
 
   // new_page: bounded readiness with no warning on a fast local page.
-  const opened = await call('new_page', { url: `${baseUrl}/` });
+  const opened = await call('new_page', { url: `${baseUrl}/`, focus: true });
   assert.match(opened, /Tab ID: \d+/);
   assert.ok(!opened.includes('did not reach readyState'), `new_page should be ready: ${opened}`);
   assert.ok(opened.includes('Title: Local MCP Test Page'), `title present after readiness: ${opened}`);
@@ -251,15 +256,16 @@ try {
     assert.match(line, /^Page\s+\d+\s*(\[ACTIVE\])?\s*: ".*" - .+$/, `list_pages line format: ${line}`);
   }
 
-  // interactive filter returns fewer nodes but keeps the controls.
-  const interactiveSnapshot = await call('take_snapshot', { tabId: tabA, interactive: true });
-  uidByName(interactiveSnapshot, 'Save', 'button');
-
-  // take_snapshot: Tab ID/Title/URL header + @eN uids. Taken last: uids are
-  // only valid for the latest snapshot of a tab.
+  // take_snapshot supports the exact Vibe options and assigns @eN uids.
+  const semanticSnapshot = await call('take_snapshot', { pageId: tabA, format: 'accessibility_tree', compact: true, maxDepth: 20 });
+  assert.match(semanticSnapshot, /Format: accessibility_tree/);
+  const scopedSnapshot = await call('take_snapshot', { pageId: tabA, format: 'aria', scopeSelector: '#dragA' });
+  assert.match(scopedSnapshot, /Drag source/);
+  assert.doesNotMatch(scopedSnapshot, /Drop target/);
   const snapshot = await call('take_snapshot', { tabId: tabA });
   assert.match(snapshot, new RegExp(`^Tab ID: ${tabA}\nTitle: Local MCP Test Page\nURL: `));
-  assert.ok(interactiveSnapshot.split('\n').length <= snapshot.split('\n').length);
+  assert.match(snapshot, /Format: markdown/);
+  assert.match(await call('take_snapshot', { tabId: tabA, changedOnly: true }), /Snapshot unchanged/);
   const linkUid = uidByName(snapshot, 'Go to page two', 'link');
   const nameUid = uidByName(snapshot, 'Name', 'textbox');
   const emailUid = uidByName(snapshot, 'Email', 'textbox');
@@ -269,7 +275,8 @@ try {
   const fileUid = uidByName(snapshot, 'Attachment');
 
   // fill + verify through the page itself.
-  await call('fill', { uid: nameUid, value: 'hello', tabId: tabA });
+  const filledWithState = await call('fill', { uid: nameUid, value: 'hello', tabId: tabA, pageStateFormat: 'markdown' });
+  assert.match(filledWithState, new RegExp(`Page state \\(markdown\\) for tab ${tabA}`));
   assert.equal(await call('evaluate_script', { function: "() => document.querySelector('#name').value", tabId: tabA }), 'hello');
 
   // fill_form fills multiple fields in one call (uids stay valid between fields).
@@ -290,7 +297,7 @@ try {
 
   // click + wait_for on a 300ms-delayed status message.
   await call('click', { uid: saveUid, tabId: tabA });
-  await call('wait_for', { text: 'Saved!', timeout: 5_000, tabId: tabA });
+  await call('wait_for', { text: ['never-first', 'Saved!'], timeout: 5_000, tabId: tabA });
 
   // press_key: Shift+h then i inserts "Hi" (the printable-character fix).
   await call('evaluate_script', { function: "() => { const i = document.querySelector('#name'); i.value = ''; i.focus(); }", tabId: tabA });
@@ -299,26 +306,24 @@ try {
   assert.equal(await call('evaluate_script', { function: "() => document.querySelector('#name').value", tabId: tabA }), 'Hi');
 
   // type_text continues at the end of the focused field.
-  await call('type_text', { text: ' there', uid: nameUid, tabId: tabA });
+  await call('type_text', { text: ' there', tabId: tabA });
   assert.equal(await call('evaluate_script', { function: "() => document.querySelector('#name').value", tabId: tabA }), 'Hi there');
 
   // hover fires mouseover on the target.
-  await call('hover', { uid: dragBUid, tabId: tabA });
+  await call('hover', { index: Number(dragBUid.replace('@e', '')), duration: 100, tabId: tabA });
   // drag delivers mousedown on the source and mouseup on the target.
-  await call('drag', { from_uid: dragAUid, to_uid: dragBUid, tabId: tabA });
+  await call('drag', { source: '#dragA', target: '#dragB', duration: 100, tabId: tabA });
   const events = await call('evaluate_script', { function: '() => window.__events.join(",")', tabId: tabA });
   assert.ok(events.includes('over:B'), `hover fired mouseover: ${events}`);
   assert.ok(events.includes('down:A'), `drag pressed on source: ${events}`);
   assert.ok(events.includes('up:B'), `drag released on target: ${events}`);
 
-  // upload_file with inline base64 content.
+  // upload_file with the top-level Vibe inline form (no host path).
   await call('upload_file', {
     uid: fileUid,
-    file: {
-      filename: 'note.txt',
-      mimeType: 'text/plain',
-      contentBase64: Buffer.from('hello upload').toString('base64'),
-    },
+    filename: 'note.txt',
+    mimeType: 'text/plain',
+    contentBase64: Buffer.from('hello upload').toString('base64'),
     tabId: tabA,
   });
   assert.equal(
@@ -327,16 +332,16 @@ try {
   );
 
   // scroll_page moves the viewport.
-  await call('scroll_page', { tabId: tabA });
+  await call('scroll_page', { direction: 'down', numPages: 1, tabId: tabA });
   const scrolled = Number(await call('evaluate_script', { function: '() => window.scrollY', tabId: tabA }));
   assert.ok(scrolled > 0, `scrolled down ${scrolled}px`);
-  await call('scroll_page', { direction: 'up', amount: 10_000, tabId: tabA });
+  await call('scroll_page', { direction: 'up', numPages: 4, tabId: tabA });
 
   // wait_for_network_idle settles on a static page.
   await call('wait_for_network_idle', { tabId: tabA, timeout: 10_000 });
 
   // evaluate_script with a callable + args, and the local extras.
-  assert.equal(await call('evaluate_script', { function: '(a, b) => a + b', args: [2, 3], tabId: tabA }), '5');
+  assert.equal(await call('evaluate_script', { function: '(a, b) => Number(a) + Number(b)', args: ['2', '3'], tabId: tabA }), '5');
   assert.equal(await call('evaluate', { expression: '1 + 1', tabId: tabA }), '2');
   assert.ok((await call('get_text', { tabId: tabA })).includes('Local MCP Test Page'));
 
@@ -344,56 +349,63 @@ try {
   await call('resize_page', { width: 800, height: 600, tabId: tabA });
   assert.equal(await call('evaluate_script', { function: '() => window.innerWidth', tabId: tabA }), '800');
 
-  // take_screenshot returns a PNG image content block.
-  const shot = await callRaw('take_screenshot', { tabId: tabA });
+  // take_screenshot honors the Vibe processing options and returns JPEG.
+  const shot = await callRaw('take_screenshot', { tabId: tabA, maxWidth: 640, grayscale: true, quality: 60, detail: 'low' });
   assert.ok(!shot.isError, `screenshot should succeed: ${text(shot)}`);
   assert.equal(shot.content[0].type, 'image');
-  assert.equal(shot.content[0].mimeType, 'image/png');
+  assert.equal(shot.content[0].mimeType, 'image/jpeg');
   assert.ok(shot.content[0].data.length > 5_000, 'screenshot has real image data');
+  assert.deepEqual([...Buffer.from(shot.content[0].data, 'base64').subarray(0, 2)], [0xff, 0xd8], 'screenshot is JPEG');
 
   // Wait tools fail hard (not warn) on timeout.
-  const waitError = await callError('wait_for', { text: 'never-appears-xyz', timeout: 800, tabId: tabA });
+  const waitError = await callError('wait_for', { text: ['never-appears-xyz'], timeout: 800, tabId: tabA });
   assert.match(waitError, /Timed out after 800ms/);
   const chordError = await callError('press_key', { keys: 'Bogus+x', tabId: tabA });
   assert.match(chordError, /Unknown modifier: Bogus/);
 
   // wait_for_condition + wait_for_url around real navigation.
-  await call('wait_for_condition', { condition: "document.readyState === 'complete'", tabId: tabA, timeout: 5_000 });
+  await call('wait_for_condition', { expression: "document.readyState === 'complete'", pollMs: 100, tabId: tabA, timeout: 5_000 });
   await call('click', { uid: linkUid, tabId: tabA });
-  await call('wait_for_url', { url: 'page2', timeout: 5_000, tabId: tabA });
+  await call('wait_for_url', { pattern: `${baseUrl}/page?.html`, timeout: 5_000, tabId: tabA });
 
   // Navigation invalidates old snapshot uids (stale interactions fail closed).
   const staleError = await callError('click', { uid: saveUid, tabId: tabA });
   assert.match(staleError, /take_snapshot/);
 
   // navigate_page: back, then explicit url, both with readiness.
-  await call('navigate_page', { url: 'ignored-for-back', type: 'back', tabId: tabA });
-  await call('wait_for_condition', { condition: "location.pathname === '/'", tabId: tabA, timeout: 5_000 });
-  const navigated = await call('navigate_page', { url: `${baseUrl}/page2.html`, tabId: tabA });
-  assert.ok(navigated.includes('Navigated (url)'), navigated);
+  await call('navigate_page', { type: 'back', pageId: tabA });
+  await call('wait_for_condition', { expression: "location.pathname === '/'", tabId: tabA, timeout: 5_000 });
+  const navigated = await call('navigate_page', { type: 'url', pageId: tabA, url: `${baseUrl}/page2.html` });
+  assert.ok(navigated.includes(`Navigated page ${tabA} (url)`), navigated);
   assert.ok(navigated.includes('Title: Second Page'), `readiness before returning: ${navigated}`);
 
-  // new_page activates a second tab; switch_to_page moves [ACTIVE] back.
+  // new_page defaults to background; switch_to_page focuses the exact page.
   const openedB = await call('new_page', { url: `${baseUrl}/page2.html` });
   const tabB = Number(openedB.match(/Tab ID: (\d+)/)[1]);
   listing = await call('list_pages');
-  assert.match(listing, new RegExp(`^Page ${tabB} \\[ACTIVE\\]: `, 'm'));
-  const switched = await call('switch_to_page', { tabId: tabA });
-  assert.ok(switched.includes(`Switched to tab ${tabA}`), switched);
+  assert.ok(!new RegExp(`^Page ${tabB} \\[ACTIVE\\]: `, 'm').test(listing), 'new page is background by default');
+  const switchedB = await call('switch_to_page', { pageId: tabB, waitForReady: true });
+  assert.ok(switchedB.includes(`Switched to page ${tabB}`), switchedB);
+  const switched = await call('switch_to_page', { pageId: tabA });
+  assert.ok(switched.includes(`Switched to page ${tabA}`), switched);
   listing = await call('list_pages');
   assert.match(listing, new RegExp(`^Page ${tabA} \\[ACTIVE\\]: `, 'm'));
   assert.ok(!new RegExp(`^Page ${tabB} \\[ACTIVE\\]: `, 'm').test(listing), 'previous tab no longer active');
 
   // close_page removes the tab from the listing.
-  await call('close_page', { tabId: tabB });
+  await call('close_page', { pageId: tabB });
   listing = await call('list_pages');
   assert.ok(!listing.includes(`Page ${tabB}`), 'closed tab is gone');
 
-  // Full-page screenshot of the tall index page.
-  await call('navigate_page', { url: `${baseUrl}/`, tabId: tabA });
-  const fullShot = await callRaw('take_screenshot', { tabId: tabA, fullPage: true });
-  assert.ok(!fullShot.isError, `full-page screenshot should succeed: ${text(fullShot)}`);
-  assert.equal(fullShot.content[0].type, 'image');
+  // Exact page IDs are mandatory for lifecycle calls.
+  assert.match(await callError('close_page', { tabId: tabA }), /requires pageId/);
+  assert.match(await callError('navigate_page', { type: 'reload', tabId: tabA }), /requires pageId/);
+
+  // Refuse final-page closure after cleaning up every non-owned test page.
+  listing = await call('list_pages');
+  const allPageIds = [...listing.matchAll(/^Page (\d+)/gm)].map((match) => Number(match[1]));
+  for (const pageId of allPageIds) if (pageId !== tabA) await call('close_page', { pageId });
+  assert.match(await callError('close_page', { pageId: tabA }), /final remaining page/);
 
   console.log('browser e2e ok: full 24-tool contract exercised against a real headless Chrome');
 } catch (error) {
