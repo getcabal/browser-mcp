@@ -1,6 +1,6 @@
 {
   "name": "local-browser-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Local-only MCP bridge for the Local Browser MCP extension",
@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/cli.js",
-    "test": "npm run build && node test/e2e.mjs && node test/local-only-audit.mjs"
+    "test": "npm run build && node test/contract-sync.mjs && node test/e2e.mjs && node test/profile-isolation.mjs && node test/local-only-audit.mjs && node test/browser-e2e.mjs",
+    "test:browser": "npm run build && node test/browser-e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

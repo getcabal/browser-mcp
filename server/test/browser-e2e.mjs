@@ -1,0 +1,412 @@
+/**
+ * Real-browser end-to-end test: a stamped extension in headless Chromium
+ * against the real bridge and local HTTP pages, exercising the full reviewed
+ * tool surface. This test is REQUIRED — it fails hard when no Chrome binary
+ * is available (set CHROME_BIN to override discovery).
+ */
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { existsSync, readdirSync } from 'node:fs';
+import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { LocalExtensionBridge } from '../dist/bridge.js';
+import { freePort, sleep } from './fake-extension.mjs';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, '../..');
+const PROFILE = 'e2e';
+
+// --- Chrome discovery (hard requirement) -----------------------------------
+
+function cachedTestingBrowsers() {
+  // Branded Google Chrome >= 137 ignores --load-extension; Chrome for Testing
+  // and Chromium builds keep it. Prefer cached automation browsers.
+  const home = homedir();
+  const roots = [
+    join(home, '.cache', 'puppeteer', 'chrome'),
+    join(home, 'Library', 'Caches', 'ms-playwright'),
+    join(home, '.cache', 'ms-playwright'),
+  ];
+  const found = [];
+  for (const root of roots) {
+    if (!existsSync(root)) continue;
+    for (const version of readdirSync(root).sort().reverse()) {
+      const versionDir = join(root, version);
+      let platforms = [];
+      try { platforms = readdirSync(versionDir); } catch { continue; }
+      for (const platform of platforms) {
+        for (const suffix of [
+          join('Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+          join('Chromium.app', 'Contents', 'MacOS', 'Chromium'),
+          'chrome',
+          'chrome-linux/chrome',
+        ]) {
+          const candidate = join(versionDir, platform, suffix);
+          if (existsSync(candidate)) found.push(candidate);
+        }
+      }
+    }
+  }
+  return found;
+}
+
+function findChrome() {
+  const candidates = [
+    process.env.CHROME_BIN,
+    '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    ...cachedTestingBrowsers(),
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+    'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+const chromeBin = findChrome();
+if (!chromeBin) {
+  console.error('browser-e2e: FAIL — no Chrome/Chromium binary found.');
+  console.error('  This real-browser test is required: it validates the actual tool contract against a live extension.');
+  console.error('  Install Google Chrome or Chromium, or set CHROME_BIN=/path/to/chrome and rerun.');
+  process.exit(1);
+}
+
+// --- Test pages ------------------------------------------------------------
+
+const INDEX_HTML = `<!doctype html>
+<html><head><title>Local MCP Test Page</title></head>
+<body>
+<h1>Local MCP Test Page</h1>
+<p><a id="go" href="/page2.html">Go to page two</a></p>
+<p><label for="name">Name</label> <input id="name" type="text"></p>
+<p><label for="email">Email</label> <input id="email" type="text"></p>
+<p><label for="file">Attachment</label> <input id="file" type="file"></p>
+<p><button id="save">Save</button></p>
+<div id="status"></div>
+<div id="dragA" role="button" aria-label="Drag source" style="width:90px;height:40px;background:#cce">A</div>
+<div id="dragB" role="button" aria-label="Drop target" style="width:90px;height:40px;background:#ecc">B</div>
+<div style="height:2000px"></div>
+<script>
+  document.getElementById('save').addEventListener('click', () => {
+    setTimeout(() => { document.getElementById('status').textContent = 'Saved!'; }, 300);
+  });
+  window.__events = [];
+  document.getElementById('dragA').addEventListener('mousedown', () => window.__events.push('down:A'));
+  document.getElementById('dragB').addEventListener('mouseup', () => window.__events.push('up:B'));
+  document.getElementById('dragB').addEventListener('mouseover', () => window.__events.push('over:B'));
+</script>
+</body></html>`;
+
+const PAGE2_HTML = `<!doctype html>
+<html><head><title>Second Page</title></head>
+<body><h1>Page two</h1><a href="/">home</a></body></html>`;
+
+// --- Harness ---------------------------------------------------------------
+
+const watchdog = setTimeout(() => {
+  console.error('browser-e2e: FAIL — 180s watchdog fired (something hung)');
+  process.exit(1);
+}, 180_000);
+
+const bridgePort = await freePort();
+const bridge = new LocalExtensionBridge({
+  port: bridgePort,
+  profile: PROFILE,
+  debug: Boolean(process.env.DEBUG_BROWSER_E2E),
+});
+await bridge.start();
+
+const pages = { '/': INDEX_HTML, '/index.html': INDEX_HTML, '/page2.html': PAGE2_HTML };
+const httpServer = createServer((req, res) => {
+  const path = new URL(req.url, 'http://127.0.0.1').pathname;
+  const body = pages[path];
+  if (!body) {
+    res.writeHead(404);
+    res.end('not found');
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  res.end(body);
+});
+await new Promise((done) => httpServer.listen(0, '127.0.0.1', done));
+const baseUrl = `http://127.0.0.1:${httpServer.address().port}`;
+
+// Stamp a copy of the extension for this test's port + profile.
+const extensionDir = await mkdtemp(join(tmpdir(), 'local-mcp-ext-'));
+await cp(resolve(repoRoot, 'extension'), extensionDir, { recursive: true });
+await writeFile(join(extensionDir, 'config.js'),
+  `export default { port: ${bridgePort}, profile: ${JSON.stringify(PROFILE)} };\n`);
+
+const cleanups = [];
+let chromeChild = null;
+let chromeStderr = '';
+
+async function launchChrome(headlessFlag) {
+  const userDataDir = await mkdtemp(join(tmpdir(), 'local-mcp-profile-'));
+  cleanups.push(() => rm(userDataDir, { recursive: true, force: true }));
+  const child = spawn(chromeBin, [
+    `--user-data-dir=${userDataDir}`,
+    `--load-extension=${extensionDir}`,
+    `--disable-extensions-except=${extensionDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-sync',
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--silent-debugger-extension-api',
+    // Re-enables --load-extension on branded Chrome builds that gate it.
+    '--disable-features=DisableLoadExtensionCommandLineSwitch',
+    headlessFlag,
+    'about:blank',
+  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  chromeStderr = '';
+  child.stderr.on('data', (chunk) => {
+    chromeStderr += chunk;
+    if (chromeStderr.length > 20_000) chromeStderr = chromeStderr.slice(-10_000);
+  });
+  return child;
+}
+
+async function stopChrome(child) {
+  if (!child || child.exitCode !== null) return;
+  child.kill('SIGTERM');
+  await Promise.race([new Promise((done) => child.once('exit', done)), sleep(2_000)]);
+  if (child.exitCode === null) child.kill('SIGKILL');
+}
+
+// Newer Chrome uses plain --headless for the new headless mode; older builds
+// want --headless=new for extension support. Try both.
+chromeChild = await launchChrome('--headless=new');
+let contract = await bridge.waitForContract(25_000);
+if (!contract.ok) {
+  await stopChrome(chromeChild);
+  chromeChild = await launchChrome('--headless');
+  contract = await bridge.waitForContract(25_000);
+}
+if (!contract.ok) {
+  console.error('browser-e2e: FAIL — extension never served the contract:');
+  for (const problem of contract.problems) console.error(`  - ${problem}`);
+  if (chromeStderr.trim()) console.error(`  chrome stderr tail:\n${chromeStderr.slice(-2_000)}`);
+  process.exit(1);
+}
+
+// --- Assertion helpers -----------------------------------------------------
+
+const text = (result) => (result.content ?? [])
+  .map((item) => (item.type === 'text' ? item.text : `[${item.type}]`))
+  .join('\n');
+
+async function call(name, args = {}, timeoutMs = 30_000) {
+  const result = await bridge.callTool(name, args, timeoutMs);
+  assert.ok(!result.isError, `${name} should succeed, got: ${text(result)}`);
+  return text(result);
+}
+
+async function callRaw(name, args = {}, timeoutMs = 30_000) {
+  return bridge.callTool(name, args, timeoutMs);
+}
+
+async function callError(name, args = {}, timeoutMs = 30_000) {
+  const result = await bridge.callTool(name, args, timeoutMs);
+  assert.ok(result.isError, `${name} should fail, got: ${text(result)}`);
+  return text(result);
+}
+
+function uidByName(snapshot, name, role) {
+  const quoted = JSON.stringify(name);
+  const line = snapshot.split('\n').find((entry) => entry.startsWith('@e')
+    && entry.includes(quoted)
+    && (!role || entry.includes(`[${role}]`)));
+  assert.ok(line, `snapshot has ${role ?? 'a node'} named ${quoted}; snapshot was:\n${snapshot}`);
+  return line.split(' ')[0];
+}
+
+let failed = false;
+try {
+  // 24 tools advertised through the bridge.
+  assert.equal(bridge.getTools().length, 24, 'extension advertises 24 tools');
+
+  // new_page: bounded readiness with no warning on a fast local page.
+  const opened = await call('new_page', { url: `${baseUrl}/` });
+  assert.match(opened, /Tab ID: \d+/);
+  assert.ok(!opened.includes('did not reach readyState'), `new_page should be ready: ${opened}`);
+  assert.ok(opened.includes('Title: Local MCP Test Page'), `title present after readiness: ${opened}`);
+  const tabA = Number(opened.match(/Tab ID: (\d+)/)[1]);
+
+  // list_pages: established plain-text format with [ACTIVE] marker.
+  let listing = await call('list_pages');
+  assert.match(listing, /^Found \d+ page\(s\):/);
+  assert.match(listing, new RegExp(`^Page ${tabA} \\[ACTIVE\\]: "Local MCP Test Page" - `, 'm'));
+  for (const line of listing.split('\n').slice(1)) {
+    assert.match(line, /^Page\s+\d+\s*(\[ACTIVE\])?\s*: ".*" - .+$/, `list_pages line format: ${line}`);
+  }
+
+  // interactive filter returns fewer nodes but keeps the controls.
+  const interactiveSnapshot = await call('take_snapshot', { tabId: tabA, interactive: true });
+  uidByName(interactiveSnapshot, 'Save', 'button');
+
+  // take_snapshot: Tab ID/Title/URL header + @eN uids. Taken last: uids are
+  // only valid for the latest snapshot of a tab.
+  const snapshot = await call('take_snapshot', { tabId: tabA });
+  assert.match(snapshot, new RegExp(`^Tab ID: ${tabA}\nTitle: Local MCP Test Page\nURL: `));
+  assert.ok(interactiveSnapshot.split('\n').length <= snapshot.split('\n').length);
+  const linkUid = uidByName(snapshot, 'Go to page two', 'link');
+  const nameUid = uidByName(snapshot, 'Name', 'textbox');
+  const emailUid = uidByName(snapshot, 'Email', 'textbox');
+  const saveUid = uidByName(snapshot, 'Save', 'button');
+  const dragAUid = uidByName(snapshot, 'Drag source', 'button');
+  const dragBUid = uidByName(snapshot, 'Drop target', 'button');
+  const fileUid = uidByName(snapshot, 'Attachment');
+
+  // fill + verify through the page itself.
+  await call('fill', { uid: nameUid, value: 'hello', tabId: tabA });
+  assert.equal(await call('evaluate_script', { function: "() => document.querySelector('#name').value", tabId: tabA }), 'hello');
+
+  // fill_form fills multiple fields in one call (uids stay valid between fields).
+  await call('fill_form', {
+    elements: [
+      { uid: nameUid, value: 'Alice' },
+      { uid: emailUid, value: 'alice@example.com' },
+    ],
+    tabId: tabA,
+  });
+  assert.equal(
+    await call('evaluate_script', {
+      function: "() => [document.querySelector('#name').value, document.querySelector('#email').value].join('|')",
+      tabId: tabA,
+    }),
+    'Alice|alice@example.com',
+  );
+
+  // click + wait_for on a 300ms-delayed status message.
+  await call('click', { uid: saveUid, tabId: tabA });
+  await call('wait_for', { text: 'Saved!', timeout: 5_000, tabId: tabA });
+
+  // press_key: Shift+h then i inserts "Hi" (the printable-character fix).
+  await call('evaluate_script', { function: "() => { const i = document.querySelector('#name'); i.value = ''; i.focus(); }", tabId: tabA });
+  await call('press_key', { keys: 'Shift+h', tabId: tabA });
+  await call('press_key', { keys: 'i', tabId: tabA });
+  assert.equal(await call('evaluate_script', { function: "() => document.querySelector('#name').value", tabId: tabA }), 'Hi');
+
+  // type_text continues at the end of the focused field.
+  await call('type_text', { text: ' there', uid: nameUid, tabId: tabA });
+  assert.equal(await call('evaluate_script', { function: "() => document.querySelector('#name').value", tabId: tabA }), 'Hi there');
+
+  // hover fires mouseover on the target.
+  await call('hover', { uid: dragBUid, tabId: tabA });
+  // drag delivers mousedown on the source and mouseup on the target.
+  await call('drag', { from_uid: dragAUid, to_uid: dragBUid, tabId: tabA });
+  const events = await call('evaluate_script', { function: '() => window.__events.join(",")', tabId: tabA });
+  assert.ok(events.includes('over:B'), `hover fired mouseover: ${events}`);
+  assert.ok(events.includes('down:A'), `drag pressed on source: ${events}`);
+  assert.ok(events.includes('up:B'), `drag released on target: ${events}`);
+
+  // upload_file with inline base64 content.
+  await call('upload_file', {
+    uid: fileUid,
+    file: {
+      filename: 'note.txt',
+      mimeType: 'text/plain',
+      contentBase64: Buffer.from('hello upload').toString('base64'),
+    },
+    tabId: tabA,
+  });
+  assert.equal(
+    await call('evaluate_script', { function: "() => document.querySelector('#file').files[0].name", tabId: tabA }),
+    'note.txt',
+  );
+
+  // scroll_page moves the viewport.
+  await call('scroll_page', { tabId: tabA });
+  const scrolled = Number(await call('evaluate_script', { function: '() => window.scrollY', tabId: tabA }));
+  assert.ok(scrolled > 0, `scrolled down ${scrolled}px`);
+  await call('scroll_page', { direction: 'up', amount: 10_000, tabId: tabA });
+
+  // wait_for_network_idle settles on a static page.
+  await call('wait_for_network_idle', { tabId: tabA, timeout: 10_000 });
+
+  // evaluate_script with a callable + args, and the local extras.
+  assert.equal(await call('evaluate_script', { function: '(a, b) => a + b', args: [2, 3], tabId: tabA }), '5');
+  assert.equal(await call('evaluate', { expression: '1 + 1', tabId: tabA }), '2');
+  assert.ok((await call('get_text', { tabId: tabA })).includes('Local MCP Test Page'));
+
+  // resize_page changes the reported viewport.
+  await call('resize_page', { width: 800, height: 600, tabId: tabA });
+  assert.equal(await call('evaluate_script', { function: '() => window.innerWidth', tabId: tabA }), '800');
+
+  // take_screenshot returns a PNG image content block.
+  const shot = await callRaw('take_screenshot', { tabId: tabA });
+  assert.ok(!shot.isError, `screenshot should succeed: ${text(shot)}`);
+  assert.equal(shot.content[0].type, 'image');
+  assert.equal(shot.content[0].mimeType, 'image/png');
+  assert.ok(shot.content[0].data.length > 5_000, 'screenshot has real image data');
+
+  // Wait tools fail hard (not warn) on timeout.
+  const waitError = await callError('wait_for', { text: 'never-appears-xyz', timeout: 800, tabId: tabA });
+  assert.match(waitError, /Timed out after 800ms/);
+  const chordError = await callError('press_key', { keys: 'Bogus+x', tabId: tabA });
+  assert.match(chordError, /Unknown modifier: Bogus/);
+
+  // wait_for_condition + wait_for_url around real navigation.
+  await call('wait_for_condition', { condition: "document.readyState === 'complete'", tabId: tabA, timeout: 5_000 });
+  await call('click', { uid: linkUid, tabId: tabA });
+  await call('wait_for_url', { url: 'page2', timeout: 5_000, tabId: tabA });
+
+  // Navigation invalidates old snapshot uids (stale interactions fail closed).
+  const staleError = await callError('click', { uid: saveUid, tabId: tabA });
+  assert.match(staleError, /take_snapshot/);
+
+  // navigate_page: back, then explicit url, both with readiness.
+  await call('navigate_page', { url: 'ignored-for-back', type: 'back', tabId: tabA });
+  await call('wait_for_condition', { condition: "location.pathname === '/'", tabId: tabA, timeout: 5_000 });
+  const navigated = await call('navigate_page', { url: `${baseUrl}/page2.html`, tabId: tabA });
+  assert.ok(navigated.includes('Navigated (url)'), navigated);
+  assert.ok(navigated.includes('Title: Second Page'), `readiness before returning: ${navigated}`);
+
+  // new_page activates a second tab; switch_to_page moves [ACTIVE] back.
+  const openedB = await call('new_page', { url: `${baseUrl}/page2.html` });
+  const tabB = Number(openedB.match(/Tab ID: (\d+)/)[1]);
+  listing = await call('list_pages');
+  assert.match(listing, new RegExp(`^Page ${tabB} \\[ACTIVE\\]: `, 'm'));
+  const switched = await call('switch_to_page', { tabId: tabA });
+  assert.ok(switched.includes(`Switched to tab ${tabA}`), switched);
+  listing = await call('list_pages');
+  assert.match(listing, new RegExp(`^Page ${tabA} \\[ACTIVE\\]: `, 'm'));
+  assert.ok(!new RegExp(`^Page ${tabB} \\[ACTIVE\\]: `, 'm').test(listing), 'previous tab no longer active');
+
+  // close_page removes the tab from the listing.
+  await call('close_page', { tabId: tabB });
+  listing = await call('list_pages');
+  assert.ok(!listing.includes(`Page ${tabB}`), 'closed tab is gone');
+
+  // Full-page screenshot of the tall index page.
+  await call('navigate_page', { url: `${baseUrl}/`, tabId: tabA });
+  const fullShot = await callRaw('take_screenshot', { tabId: tabA, fullPage: true });
+  assert.ok(!fullShot.isError, `full-page screenshot should succeed: ${text(fullShot)}`);
+  assert.equal(fullShot.content[0].type, 'image');
+
+  console.log('browser e2e ok: full 24-tool contract exercised against a real headless Chrome');
+} catch (error) {
+  failed = true;
+  console.error('browser-e2e: FAIL —', error?.message || error);
+  if (chromeStderr.trim()) console.error(`chrome stderr tail:\n${chromeStderr.slice(-2_000)}`);
+  throw error;
+} finally {
+  clearTimeout(watchdog);
+  await stopChrome(chromeChild);
+  await bridge.stop();
+  await new Promise((done) => httpServer.close(done));
+  await rm(extensionDir, { recursive: true, force: true });
+  for (const cleanup of cleanups) await cleanup().catch(() => {});
+  if (failed) process.exitCode = 1;
+}
