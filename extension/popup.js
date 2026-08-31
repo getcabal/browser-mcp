@@ -11,6 +11,9 @@ function refresh() {
     document.getElementById('port').textContent = String(state.port);
     document.getElementById('profile').textContent = state.profile === null ? '(none)' : state.profile;
     document.getElementById('version').textContent = state.version;
+    document.getElementById('route-note').textContent = state.locked
+      ? 'Fleet route locked by the stamped artifact. No hosted relay, account, token, or remote-control mode exists.'
+      : 'Development route; configure port/profile in Options. No hosted relay, account, token, or remote-control mode exists.';
     if (state.fatal) {
       statusEl.textContent = 'Handshake rejected — reconnect disabled';
       statusEl.style.color = '#ff8484';

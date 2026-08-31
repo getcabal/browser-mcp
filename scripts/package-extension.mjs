@@ -157,7 +157,7 @@ function buildZip(entries) {
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 
 const stampedConfig = (port, name) =>
-  `/**\n * Per-profile deployment configuration. Stamped by scripts/package-extension.mjs;\n * chrome.storage.local overrides these defaults at runtime (options page).\n */\nexport default { port: ${port}, profile: ${JSON.stringify(name)} };\n`;
+  `/**\n * Per-profile deployment configuration. Stamped by scripts/package-extension.mjs;\n * locked fleet routes cannot be overridden through chrome.storage.local.\n */\nexport default Object.freeze(${JSON.stringify({ port, profile: name, locked: true })});\n`;
 
 async function loadEntries(configOverride) {
   const entries = [];

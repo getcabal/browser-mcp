@@ -53,7 +53,9 @@ assert.equal(
 );
 
 const config = await readFile(files[6], 'utf8');
-assert.match(config, /port: 19889/, 'config.js default port is 19889');
-assert.match(config, /profile: null/, 'config.js default profile is null');
+assert.match(config, /"port": 19889/, 'config.js default port is 19889');
+assert.match(config, /"profile": null/, 'config.js default profile is null');
+assert.match(config, /"locked": false/, 'base development config is explicitly unlocked');
+assert.doesNotMatch(background, /DOM\.setFileInputFiles/, 'extension cannot upload arbitrary host filesystem paths');
 
 console.log('local-only source audit ok');

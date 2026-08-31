@@ -28,6 +28,19 @@ async function computeDirHash(dir, files) {
   return sha256(out);
 }
 
+function parseStaticConfig(source, label) {
+  const match = source.match(/export\s+default\s+Object\.freeze\((\{[\s\S]*\})\)\s*;/);
+  if (!match) throw new Error(`${label} must export Object.freeze(<JSON object>)`);
+  let config;
+  try { config = JSON.parse(match[1]); }
+  catch (error) { throw new Error(`${label} contains invalid JSON: ${error.message}`); }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error(`${label} is not an object`);
+  if (!Number.isInteger(config.port) || config.port < 1024 || config.port > 65535) throw new Error(`${label} has bad port ${config.port}`);
+  if (config.profile !== null && (typeof config.profile !== 'string' || !config.profile.trim())) throw new Error(`${label} has invalid profile`);
+  if (typeof config.locked !== 'boolean') throw new Error(`${label} has no boolean locked flag`);
+  return config;
+}
+
 await check('Node.js 18 or newer', async () => {
   if (Number(process.versions.node.split('.')[0]) < 18) throw new Error(`found ${process.versions.node}`);
 });
@@ -52,9 +65,8 @@ await check('Extension advertises the 24-tool contract', async () => {
   return '22 contract tools + 2 local extras';
 });
 await check('Extension config has local-only defaults', async () => {
-  const { default: config } = await import(pathToFileURL(join(root, 'extension/config.js')).href);
-  if (!Number.isInteger(config.port) || config.port < 1024 || config.port > 65535) throw new Error(`bad port ${config.port}`);
-  return `port ${config.port}, profile ${config.profile === null ? '(none)' : JSON.stringify(config.profile)}`;
+  const config = parseStaticConfig(await readFile(join(root, 'extension/config.js'), 'utf8'), 'extension/config.js');
+  return `port ${config.port}, profile ${config.profile === null ? '(none)' : JSON.stringify(config.profile)}, locked=${config.locked}`;
 });
 
 // --- Installed-copy verification -------------------------------------------
@@ -69,6 +81,7 @@ if (dirFlag !== -1) {
     const dir = resolve(target);
     let installedManifest = null;
     let installedConfig = null;
+    let matchedArtifact = null;
     await check(`Installed dir readable (${target})`, async () => {
       await readdir(dir);
     });
@@ -80,12 +93,8 @@ if (dirFlag !== -1) {
       }
       return `version ${installedManifest.version}`;
     });
-    await check('Installed config declares port and profile', async () => {
-      const module = await import(pathToFileURL(join(dir, 'config.js')).href);
-      installedConfig = module.default;
-      if (!Number.isInteger(installedConfig.port)) throw new Error('config.js has no integer port');
-      return `port ${installedConfig.port}, profile ${installedConfig.profile === null ? '(none)' : JSON.stringify(installedConfig.profile)}`;
-    });
+    // Hash the installed allowlisted files before parsing any installed data.
+    // In particular, doctor never imports or executes an installed config.js.
     await check('Installed content hash matches a packaged artifact', async () => {
       const artifactsPath = join(root, 'dist/artifacts.json');
       let artifacts;
@@ -95,10 +104,28 @@ if (dirFlag !== -1) {
         throw new Error('dist/artifacts.json not found — run: npm run package');
       }
       const hash = await computeDirHash(dir, artifacts.files);
-      if (artifacts.base.dirHash === hash) return `matches base artifact (dirHash ${hash.slice(0, 16)}…)`;
+      if (artifacts.base.dirHash === hash) {
+        matchedArtifact = { kind: 'base', ...artifacts.base };
+        return `matches base artifact (dirHash ${hash.slice(0, 16)}…)`;
+      }
       const match = artifacts.profiles.find((profile) => profile.dirHash === hash);
-      if (match) return `matches profile "${match.name}" (port ${match.port}, dirHash ${hash.slice(0, 16)}…)`;
+      if (match) {
+        matchedArtifact = { kind: 'profile', ...match };
+        return `matches profile "${match.name}" (port ${match.port}, dirHash ${hash.slice(0, 16)}…)`;
+      }
       throw new Error(`dirHash ${hash.slice(0, 16)}… matches no packaged artifact — stale or modified install`);
+    });
+    await check('Installed config is inert and routing state is explicit', async () => {
+      installedConfig = parseStaticConfig(await readFile(join(dir, 'config.js'), 'utf8'), 'installed config.js');
+      if (matchedArtifact?.kind === 'profile') {
+        if (installedConfig.locked !== true) throw new Error('profile artifact is not locked');
+        if (installedConfig.profile !== matchedArtifact.name || installedConfig.port !== matchedArtifact.port) {
+          throw new Error(`config route does not match artifact metadata (${matchedArtifact.name}:${matchedArtifact.port})`);
+        }
+        return `effective route is locked to ${installedConfig.profile}:${installedConfig.port}`;
+      }
+      if (installedConfig.locked) throw new Error('base development artifact unexpectedly locked');
+      return `development artifact defaults to ${installedConfig.profile ?? '(none)'}:${installedConfig.port}; chrome.storage.local may override it at runtime`;
     });
   }
 }

@@ -1,14 +1,27 @@
+import DEFAULT_CONFIG from './config.js';
+
 const portInput = document.getElementById('port');
 const profileInput = document.getElementById('profile');
 const saved = document.getElementById('saved');
 
-chrome.storage.local.get(['port', 'profile'], (stored) => {
-  if (Number.isInteger(stored.port)) portInput.value = String(stored.port);
-  if (typeof stored.profile === 'string') profileInput.value = stored.profile;
-});
+if (DEFAULT_CONFIG.locked === true) {
+  portInput.value = String(DEFAULT_CONFIG.port);
+  profileInput.value = DEFAULT_CONFIG.profile ?? '';
+  portInput.disabled = true;
+  profileInput.disabled = true;
+  document.querySelector('button[type="submit"]').disabled = true;
+  saved.textContent = 'This fleet artifact is locked to its stamped profile and port.';
+  saved.style.color = '#5ee6a8';
+} else {
+  chrome.storage.local.get(['port', 'profile'], (stored) => {
+    portInput.value = String(Number.isInteger(stored.port) ? stored.port : DEFAULT_CONFIG.port);
+    profileInput.value = typeof stored.profile === 'string' ? stored.profile : (DEFAULT_CONFIG.profile ?? '');
+  });
+}
 
 document.getElementById('form').addEventListener('submit', (event) => {
   event.preventDefault();
+  if (DEFAULT_CONFIG.locked === true) return;
   const updates = {};
   const removals = [];
   const portText = portInput.value.trim();
