@@ -95,6 +95,8 @@ const INDEX_HTML = `<!doctype html>
 <p><a id="go" href="/page2.html">Go to page two</a></p>
 <p><label for="name">Name</label> <input id="name" type="text"></p>
 <p><label for="email">Email</label> <input id="email" type="text"></p>
+<p id="auth-email">person@example.com</p>
+<p><label for="sms-code">Verification code</label> <input id="sms-code" name="sms-code" type="number" inputmode="numeric" maxlength="6"></p>
 <p><label for="file">Attachment</label> <input id="file" type="file"></p>
 <p><button id="save">Save</button></p>
 <div id="status"></div>
@@ -159,7 +161,7 @@ let chromeStderr = '';
 async function launchChrome(headlessFlag) {
   const userDataDir = await mkdtemp(join(tmpdir(), 'local-mcp-profile-'));
   cleanups.push(() => rm(userDataDir, { recursive: true, force: true }));
-  const child = spawn(chromeBin, [
+  const args = [
     `--user-data-dir=${userDataDir}`,
     `--load-extension=${extensionDir}`,
     `--disable-extensions-except=${extensionDir}`,
@@ -171,9 +173,10 @@ async function launchChrome(headlessFlag) {
     '--silent-debugger-extension-api',
     // Re-enables --load-extension on branded Chrome builds that gate it.
     '--disable-features=DisableLoadExtensionCommandLineSwitch',
-    headlessFlag,
     'about:blank',
-  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  ];
+  if (headlessFlag) args.splice(args.length - 1, 0, headlessFlag);
+  const child = spawn(chromeBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
   chromeStderr = '';
   child.stderr.on('data', (chunk) => {
     chromeStderr += chunk;
@@ -190,10 +193,13 @@ async function stopChrome(child) {
 }
 
 // Newer Chrome uses plain --headless for the new headless mode; older builds
-// want --headless=new for extension support. Try both.
-chromeChild = await launchChrome('--headless=new');
+// want --headless=new for extension support. Try both. macOS Chrome for
+// Testing currently ignores unpacked extensions in headless mode, so local
+// real-browser verification can opt into a headed run explicitly.
+const headed = process.env.BROWSER_E2E_HEADED === '1';
+chromeChild = await launchChrome(headed ? null : '--headless=new');
 let contract = await bridge.waitForContract(25_000);
-if (!contract.ok) {
+if (!contract.ok && !headed) {
   await stopChrome(chromeChild);
   chromeChild = await launchChrome('--headless');
   contract = await bridge.waitForContract(25_000);
@@ -229,11 +235,11 @@ async function callError(name, args = {}, timeoutMs = 30_000) {
 
 function uidByName(snapshot, name, role) {
   const quoted = JSON.stringify(name);
-  const line = snapshot.split('\n').find((entry) => entry.startsWith('@e')
+  const line = snapshot.split('\n').find((entry) => entry.trimStart().startsWith('@e')
     && entry.includes(quoted)
-    && (!role || entry.includes(`[${role}]`)));
+    && (!role || entry.includes(`[${role}]`) || entry.includes(`role=${JSON.stringify(role)}`)));
   assert.ok(line, `snapshot has ${role ?? 'a node'} named ${quoted}; snapshot was:\n${snapshot}`);
-  return line.split(' ')[0];
+  return line.trimStart().split(' ')[0];
 }
 
 let failed = false;
@@ -266,9 +272,9 @@ try {
   assert.match(snapshot, new RegExp(`^Tab ID: ${tabA}\nTitle: Local MCP Test Page\nURL: `));
   assert.match(snapshot, /Format: markdown/);
   assert.match(await call('take_snapshot', { tabId: tabA, changedOnly: true }), /Snapshot unchanged/);
-  const linkUid = uidByName(snapshot, 'Go to page two', 'link');
   const nameUid = uidByName(snapshot, 'Name', 'textbox');
   const emailUid = uidByName(snapshot, 'Email', 'textbox');
+  const otpUid = uidByName(snapshot, 'Verification code', 'spinbutton');
   const saveUid = uidByName(snapshot, 'Save', 'button');
   const dragAUid = uidByName(snapshot, 'Drag source', 'button');
   const dragBUid = uidByName(snapshot, 'Drop target', 'button');
@@ -363,13 +369,24 @@ try {
   const chordError = await callError('press_key', { keys: 'Bogus+x', tabId: tabA });
   assert.match(chordError, /Unknown modifier: Bogus/);
 
+  // Authentication values and nearby account identifiers are redacted. A
+  // fresh snapshot deliberately rotates uids, so use its navigation uids.
+  await call('fill', { uid: otpUid, value: '123456', tabId: tabA });
+  const protectedSnapshot = await call('take_snapshot', { tabId: tabA, format: 'accessibility_tree' });
+  assert.doesNotMatch(protectedSnapshot, /123456/, 'one-time code value must not appear in snapshots');
+  assert.match(protectedSnapshot, /\[REDACTED\]/, 'sensitive input subtree is explicitly redacted');
+  assert.doesNotMatch(protectedSnapshot, /person@example\.com/, 'account email must not appear beside authentication inputs');
+  assert.match(protectedSnapshot, /\[REDACTED EMAIL\]/);
+  const navigationLinkUid = uidByName(protectedSnapshot, 'Go to page two', 'link');
+  const staleSaveUid = uidByName(protectedSnapshot, 'Save', 'button');
+
   // wait_for_condition + wait_for_url around real navigation.
   await call('wait_for_condition', { expression: "document.readyState === 'complete'", pollMs: 100, tabId: tabA, timeout: 5_000 });
-  await call('click', { uid: linkUid, tabId: tabA });
+  await call('click', { uid: navigationLinkUid, tabId: tabA });
   await call('wait_for_url', { pattern: `${baseUrl}/page?.html`, timeout: 5_000, tabId: tabA });
 
   // Navigation invalidates old snapshot uids (stale interactions fail closed).
-  const staleError = await callError('click', { uid: saveUid, tabId: tabA });
+  const staleError = await callError('click', { uid: staleSaveUid, tabId: tabA });
   assert.match(staleError, /take_snapshot/);
 
   // navigate_page: back, then explicit url, both with readiness.
@@ -407,7 +424,7 @@ try {
   for (const pageId of allPageIds) if (pageId !== tabA) await call('close_page', { pageId });
   assert.match(await callError('close_page', { pageId: tabA }), /final remaining page/);
 
-  console.log('browser e2e ok: full 24-tool contract exercised against a real headless Chrome');
+  console.log(`browser e2e ok: full 24-tool contract exercised against a real ${headed ? 'headed' : 'headless'} Chrome`);
 } catch (error) {
   failed = true;
   console.error('browser-e2e: FAIL —', error?.message || error);

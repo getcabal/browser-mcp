@@ -252,6 +252,7 @@ the matching flags.
 ```bash
 npm run package -- --profile alpha:19901 --profile beta:19902
 # or from a JSON manifest: npm run package -- --profiles fleet.json
+# tests and other isolated builds can use: --output-dir /tmp/browser-mcp-dist
 ```
 
 This produces, deterministically (byte-identical zips for identical sources —
@@ -263,6 +264,10 @@ dist/profiles/<name>/                                          stamped unpacked 
 dist/local-browser-extension-<version>-<name>.zip(+.sha256)    stamped zip
 dist/artifacts.json                                            versions, ports, content hashes
 ```
+
+The deployment test packages into a private temporary output directory, so
+running `npm test` cannot delete or replace the active `dist/profiles/*`
+deployment artifacts.
 
 A 12-instance fleet is one port per profile, e.g.:
 
@@ -371,6 +376,10 @@ at a binary to override:
 ```bash
 CHROME_BIN="$HOME/.cache/puppeteer/chrome/<ver>/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" npm test
 ```
+
+If a macOS Chrome-for-Testing build ignores unpacked extensions in headless
+mode, run the same real-browser suite with `BROWSER_E2E_HEADED=1`. The test
+still uses a fresh isolated profile and the stamped loopback-only extension.
 
 ### Manual smoke test
 

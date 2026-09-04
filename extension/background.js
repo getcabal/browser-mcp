@@ -12,6 +12,8 @@
  */
 
 import DEFAULT_CONFIG from './config.js';
+import { isMissingProtocolVersion, isRetryableLegacyProtocolFatal } from './handshake.js';
+import { isSensitiveInputNode, redactSensitiveAccessibleName, redactSensitiveUrl } from './redaction.js';
 import { PROTOCOL_VERSION, TOOLS } from './tools.js';
 
 const HEARTBEAT_MS = 15_000;
@@ -82,7 +84,12 @@ async function clearFatal() {
 async function connect() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
-  if (await getFatal()) return;
+  const fatal = await getFatal();
+  if (fatal) {
+    if (!isRetryableLegacyProtocolFatal(fatal)) return;
+    await clearFatal();
+    log('cleared retryable legacy protocol state; reconnecting to the configured bridge');
+  }
   activeConfig = await resolveConfig();
   const generation = ++socketGeneration;
   let ws;
@@ -192,6 +199,12 @@ const formatProfile = (profile) => (profile === null || profile === undefined ? 
 
 async function handlePong(message) {
   if (message.protocolVersion !== PROTOCOL_VERSION) {
+    if (isMissingProtocolVersion(message.protocolVersion)) {
+      log('legacy bridge omitted protocol version; refusing the session and retrying');
+      teardownSocket();
+      scheduleReconnect();
+      return;
+    }
     await failFatal(4426, `Server protocol ${message.protocolVersion ?? '(none)'} does not match extension protocol ${PROTOCOL_VERSION}`);
     return;
   }
@@ -402,7 +415,7 @@ function requireTabId(args, toolName) {
 async function pageLines(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
-    return `Tab ID: ${tab.id}\nTitle: ${tab.title || ''}\nURL: ${tab.url || tab.pendingUrl || ''}`;
+    return `Tab ID: ${tab.id}\nTitle: ${tab.title || ''}\nURL: ${redactSensitiveUrl(tab.url || tab.pendingUrl || '')}`;
   } catch {
     return `Tab ID: ${tabId}\nTitle: \nURL: `;
   }
@@ -509,6 +522,28 @@ async function takeSnapshotFor(tabId, options = {}) {
   }
   const nodes = await accessibilityNodes(tabId, options);
   const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+  const sensitiveNodeIds = new Set();
+  await Promise.all(nodes.map(async (node) => {
+    const role = node.role?.value || '';
+    if (typeof node.backendDOMNodeId !== 'number') return;
+    if (!INTERACTIVE_ROLES.has(role.toLowerCase())) return;
+    try {
+      const described = await cdp(tabId, 'DOM.describeNode', { backendNodeId: node.backendDOMNodeId });
+      if (isSensitiveInputNode(role, described.node?.attributes || [])) sensitiveNodeIds.add(node.nodeId);
+    } catch {
+      // A detached node cannot contribute a stable snapshot entry.
+    }
+  }));
+  const sensitiveAncestorFor = (node) => {
+    let cursor = node;
+    const seen = new Set();
+    while (cursor && !seen.has(cursor.nodeId)) {
+      seen.add(cursor.nodeId);
+      if (sensitiveNodeIds.has(cursor.nodeId)) return true;
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : null;
+    }
+    return false;
+  };
   const depthFor = (node) => {
     let depth = 0;
     let cursor = node;
@@ -528,6 +563,7 @@ async function takeSnapshotFor(tabId, options = {}) {
     if (node.ignored) continue;
     const role = node.role?.value || '';
     const name = node.name?.value || '';
+    const outputName = redactSensitiveAccessibleName(name, sensitiveAncestorFor(node), sensitiveNodeIds.size > 0);
     if (!role || SKIPPED_ROLES.has(role)) continue;
     const interactive = INTERACTIVE_ROLES.has(role.toLowerCase());
     if (options.compact === true && !name && !interactive) continue;
@@ -538,9 +574,9 @@ async function takeSnapshotFor(tabId, options = {}) {
     refs.set(uid, { backendNodeId: node.backendDOMNodeId, role, name });
     if (lines.length < MAX_SNAPSHOT_LINES) {
       const depth = depthFor(node);
-      if (format === 'markdown') lines.push(`${uid} [${role}] ${JSON.stringify(name)}`);
-      else if (format === 'aria') lines.push(`${'  '.repeat(depth)}${role} ${JSON.stringify(name)} [uid=${uid}]`);
-      else lines.push(`${'  '.repeat(depth)}${uid} role=${JSON.stringify(role)} name=${JSON.stringify(name)}`);
+      if (format === 'markdown') lines.push(`${uid} [${role}] ${JSON.stringify(outputName)}`);
+      else if (format === 'aria') lines.push(`${'  '.repeat(depth)}${role} ${JSON.stringify(outputName)} [uid=${uid}]`);
+      else lines.push(`${'  '.repeat(depth)}${uid} role=${JSON.stringify(role)} name=${JSON.stringify(outputName)}`);
     } else {
       omitted += 1;
     }
@@ -843,7 +879,7 @@ const executors = {
     tabs.sort((a, b) => (a.id || 0) - (b.id || 0));
     const lines = tabs.map((tab) => {
       const active = tab.active ? ' [ACTIVE]' : '';
-      return `Page ${tab.id}${active}: "${tab.title || ''}" - ${tab.url || tab.pendingUrl || ''}`;
+      return `Page ${tab.id}${active}: "${tab.title || ''}" - ${redactSensitiveUrl(tab.url || tab.pendingUrl || '')}`;
     });
     return [`Found ${tabs.length} page(s):`, ...lines].join('\n');
   },

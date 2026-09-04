@@ -72,6 +72,11 @@ await check('Extension config has local-only defaults', async () => {
 // --- Installed-copy verification -------------------------------------------
 
 const argv = process.argv.slice(2);
+const artifactsFlag = argv.indexOf('--artifacts');
+const artifactsFile = artifactsFlag === -1 ? null : argv[artifactsFlag + 1];
+if (artifactsFlag !== -1 && !artifactsFile) {
+  checks.push(['--artifacts', false, 'requires a path']);
+}
 const dirFlag = argv.indexOf('--extension-dir');
 if (dirFlag !== -1) {
   const target = argv[dirFlag + 1];
@@ -96,12 +101,14 @@ if (dirFlag !== -1) {
     // Hash the installed allowlisted files before parsing any installed data.
     // In particular, doctor never imports or executes an installed config.js.
     await check('Installed content hash matches a packaged artifact', async () => {
-      const artifactsPath = join(root, 'dist/artifacts.json');
+      const artifactsPath = artifactsFile
+        ? resolve(artifactsFile)
+        : join(root, 'dist/artifacts.json');
       let artifacts;
       try {
         artifacts = JSON.parse(await readFile(artifactsPath, 'utf8'));
       } catch {
-        throw new Error('dist/artifacts.json not found — run: npm run package');
+        throw new Error(`${artifactsPath} not found — run: npm run package`);
       }
       const hash = await computeDirHash(dir, artifacts.files);
       if (artifacts.base.dirHash === hash) {

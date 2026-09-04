@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { LocalMcpServer } from './server.js';
 import { VERSION } from './contract.js';
+import { resolve } from 'node:path';
 
 const USAGE = `local-browser-mcp ${VERSION} — local-only browser MCP server (stdio)
 
@@ -82,7 +83,18 @@ for (let i = 0; i < argv.length; i += 1) {
   }
 }
 
-const server = new LocalMcpServer({ port, debug, profile, requireExtension, extensionConnectTimeoutMs });
+const stateDir = (process.env.BROWSER_MCP_STATE_DIR ?? '').trim();
+const credentialSocket = profile && stateDir
+  ? resolve(stateDir, 'credential.sock')
+  : null;
+const server = new LocalMcpServer({
+  port,
+  debug,
+  profile,
+  requireExtension,
+  extensionConnectTimeoutMs,
+  credentialSocket,
+});
 server.start().catch((error) => {
   console.error('local-browser: failed to start:', error instanceof Error ? error.message : error);
   process.exit(1);

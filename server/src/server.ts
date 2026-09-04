@@ -4,6 +4,16 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { LocalExtensionBridge } from './bridge.js';
 import { VERSION, enrichTools } from './contract.js';
+import {
+  captureProtectedServiceTitanSms,
+  deliverProtectedClipboardPaste,
+  isProtectedPasteCall,
+  isProtectedSmsCaptureCall,
+  ProfileCredentialBroker,
+  ProtectedPasteState,
+  readSystemClipboard,
+} from './protected-paste.js';
+import type { ClipboardReader } from './protected-paste.js';
 
 export interface ServerOptions {
   port?: number;
@@ -11,6 +21,8 @@ export interface ServerOptions {
   profile?: string | null;
   requireExtension?: boolean;
   extensionConnectTimeoutMs?: number;
+  clipboardReader?: ClipboardReader;
+  credentialSocket?: string | null;
 }
 
 export class LocalMcpServer {
@@ -18,12 +30,20 @@ export class LocalMcpServer {
   private readonly mcp: Server;
   private readonly requireExtension: boolean;
   private readonly extensionConnectTimeoutMs: number;
+  private readonly clipboardReader: ClipboardReader | null;
+  private readonly protectedPasteState = new ProtectedPasteState();
+  private readonly credentialBroker: ProfileCredentialBroker | null;
   private connected = false;
   private graceTimer: NodeJS.Timeout | null = null;
 
   constructor(options: ServerOptions = {}) {
     this.requireExtension = options.requireExtension ?? false;
     this.extensionConnectTimeoutMs = options.extensionConnectTimeoutMs ?? 90_000;
+    this.clipboardReader = options.clipboardReader
+      ?? (options.credentialSocket ? null : readSystemClipboard);
+    this.credentialBroker = options.credentialSocket
+      ? new ProfileCredentialBroker(options.credentialSocket, this.protectedPasteState)
+      : null;
     this.bridge = new LocalExtensionBridge({
       port: options.port,
       debug: options.debug,
@@ -41,10 +61,22 @@ export class LocalMcpServer {
 
     this.mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       try {
-        const result = await this.bridge.callTool(
-          request.params.name,
-          (request.params.arguments as Record<string, unknown> | undefined) ?? {},
-        );
+        const args =
+          (request.params.arguments as Record<string, unknown> | undefined) ?? {};
+        const result = isProtectedSmsCaptureCall(request.params.name, args)
+          ? await captureProtectedServiceTitanSms(
+            this.bridge,
+            args,
+            this.protectedPasteState,
+          )
+          : isProtectedPasteCall(request.params.name, args)
+            ? await deliverProtectedClipboardPaste(
+              this.bridge,
+              args,
+              this.clipboardReader,
+              this.protectedPasteState,
+            )
+            : await this.bridge.callTool(request.params.name, args);
         return result as unknown as CallToolResult;
       } catch (error) {
         return {
@@ -100,9 +132,16 @@ export class LocalMcpServer {
         process.exit(1);
       }
     }
-    const transport = new StdioServerTransport();
-    await this.mcp.connect(transport);
-    this.connected = true;
+    try {
+      await this.credentialBroker?.start();
+      const transport = new StdioServerTransport();
+      await this.mcp.connect(transport);
+      this.connected = true;
+    } catch (error) {
+      await this.credentialBroker?.stop();
+      await this.bridge.stop();
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -111,6 +150,8 @@ export class LocalMcpServer {
       this.graceTimer = null;
     }
     this.connected = false;
+    this.protectedPasteState.clear();
+    await this.credentialBroker?.stop();
     try { await this.mcp.close(); } catch { /* transport already gone */ }
     await this.bridge.stop();
   }

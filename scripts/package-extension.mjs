@@ -12,24 +12,26 @@
  *   node scripts/package-extension.mjs
  *   node scripts/package-extension.mjs --profile alpha:19901 --profile beta:19902
  *   node scripts/package-extension.mjs --profiles fleet.json   # [{"name":"alpha","port":19901}, ...]
+ *   node scripts/package-extension.mjs --output-dir /tmp/browser-mcp-dist --profile test:21901
  */
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 
 const root = resolve(import.meta.dirname, '..');
-const distDir = join(root, 'dist');
 
 /** Sorted allowlist — the complete deployable extension. */
 const EXTENSION_FILES = [
   'background.js',
   'config.js',
+  'handshake.js',
   'manifest.json',
   'options.html',
   'options.js',
   'popup.css',
   'popup.html',
   'popup.js',
+  'redaction.js',
   'tools.js',
 ];
 
@@ -54,10 +56,15 @@ const version = manifest.version;
 // --- Profile arguments ------------------------------------------------------
 
 const profiles = [];
+let outputDir = null;
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i += 1) {
   const arg = argv[i];
-  if (arg === '--profile') {
+  if (arg === '--output-dir') {
+    const path = argv[++i];
+    if (!path) fail('--output-dir requires a path');
+    outputDir = resolve(path);
+  } else if (arg === '--profile') {
     const spec = argv[++i] ?? '';
     const match = spec.match(/^([^:]+):(\d+)$/);
     if (!match) fail(`--profile expects name:port, got "${spec}"`);
@@ -72,6 +79,7 @@ for (let i = 0; i < argv.length; i += 1) {
     fail(`unknown option: ${arg}`);
   }
 }
+const distDir = outputDir ?? join(root, 'dist');
 for (const profile of profiles) {
   if (typeof profile.name !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(profile.name)) {
     fail(`invalid profile name "${profile.name}" (use letters, digits, dot, dash, underscore)`);
@@ -203,7 +211,7 @@ for (const profile of profiles) {
   artifactProfiles.push({
     name: profile.name,
     port: profile.port,
-    dir: `dist/profiles/${profile.name}`,
+    dir: relative(root, profileDir),
     ...emitted,
   });
   console.log(`profile   ${profile.name} (port ${profile.port})  ${emitted.zip}  sha256=${emitted.sha256.slice(0, 16)}…`);

@@ -16,9 +16,12 @@ const files = [
   resolve(here, '../../extension/background.js'),
   resolve(here, '../../extension/tools.js'),
   resolve(here, '../../extension/config.js'),
+  resolve(here, '../../extension/handshake.js'),
   resolve(here, '../../extension/options.js'),
   resolve(here, '../../extension/popup.js'),
+  resolve(here, '../../extension/redaction.js'),
   resolve(here, '../../extension/manifest.json'),
+  resolve(here, '../src/protected-paste.ts'),
 ];
 const forbidden = [
   /wss:\/\//i,
