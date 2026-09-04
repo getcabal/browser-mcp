@@ -95,13 +95,30 @@ const server = new LocalMcpServer({
   extensionConnectTimeoutMs,
   credentialSocket,
 });
+let shuttingDown = false;
+const shutdown = (exitCode: number): void => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  void server.stop().finally(() => process.exit(exitCode));
+};
+
 server.start().catch((error) => {
   console.error('local-browser: failed to start:', error instanceof Error ? error.message : error);
   process.exit(1);
 });
 
+// The upstream StdioServerTransport does not subscribe to stdin end/close.
+// Without these handlers, a disconnected MCP host can leave the WebSocket
+// bridge alive indefinitely, retaining the profile's fixed extension port and
+// making every reconnect fail closed as "port already occupied".
+process.stdin.once('end', () => shutdown(0));
+process.stdin.once('close', () => shutdown(0));
+process.stdout.once('error', (error: NodeJS.ErrnoException) => {
+  shutdown(error.code === 'EPIPE' ? 0 : 1);
+});
+
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
-    void server.stop().finally(() => process.exit(0));
+    shutdown(0);
   });
 }
