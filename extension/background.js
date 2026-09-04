@@ -1100,10 +1100,17 @@ const executors = {
     ) {
       throw new Error('click_at_ratio requires finite xRatio and yRatio values strictly between 0 and 1');
     }
-    const metrics = await cdp(tabId, 'Page.getLayoutMetrics', {});
-    const viewport = metrics.cssVisualViewport || metrics.cssLayoutViewport || metrics.layoutViewport;
-    const width = Number(viewport?.clientWidth || viewport?.width);
-    const height = Number(viewport?.clientHeight || viewport?.height);
+    // Use the page's CSS viewport directly. Page.getLayoutMetrics is not
+    // consistently available through chrome.debugger on hardened sign-in
+    // pages, even though Runtime and Input are available on the same target.
+    // Screenshot ratios are defined against this viewport, so window metrics
+    // are also the exact coordinate space expected by Input.dispatchMouseEvent.
+    const viewport = await evaluateInPage(
+      tabId,
+      '({ width: window.innerWidth, height: window.innerHeight })',
+    );
+    const width = Number(viewport?.width);
+    const height = Number(viewport?.height);
     if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
       throw new Error('click_at_ratio could not resolve the current viewport');
     }
