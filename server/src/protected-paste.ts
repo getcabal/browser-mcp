@@ -331,9 +331,10 @@ function protectedSmsCaptureExpression(provider: ProtectedSmsProvider): string {
     if (location.hostname !== 'voice.google.com' || !location.pathname.startsWith('/u/0/messages')) {
       throw new Error('Protected SMS capture requires the verified Google Voice messages page');
     }
-    if (document.visibilityState !== 'visible') {
-      throw new Error('Protected SMS capture requires the active Google Voice tab');
-    }
+    // The MCP new-page primitive intentionally opens temporary pages in the
+    // background. Exact tab binding plus host, path, and identity validation
+    // are the security boundary; requiring foreground visibility makes the
+    // normal protected-transfer workflow fail while the screen is locked.
     const approvedIdentity = 'ocuser@qualitechmgmt.com';
     const identityPresent = Array.from(document.querySelectorAll('[aria-label],[data-tooltip]')).some((element) => {
       const text = (element.getAttribute('aria-label') || '') + ' ' + (element.getAttribute('data-tooltip') || '');

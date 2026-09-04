@@ -251,7 +251,7 @@ const captureResult = await captureProtectedServiceTitanSms(
 assert.equal(smsCaptureObserved.name, 'evaluate');
 assert.equal(smsCaptureObserved.args.tabId, 9);
 assert.match(smsCaptureObserved.args.expression, /voice\.google\.com/);
-assert.match(smsCaptureObserved.args.expression, /document\.visibilityState !== 'visible'/);
+assert.doesNotMatch(smsCaptureObserved.args.expression, /document\.visibilityState/);
 assert.match(smsCaptureObserved.args.expression, /ocuser@qualitechmgmt\.com/);
 assert.match(smsCaptureObserved.args.expression, /service\[\\s_-\]\*titan/);
 assert.match(smsCaptureObserved.args.expression, /querySelectorAll\('body \*'\)/);
