@@ -452,15 +452,15 @@ function requirePrivateFlag(
   }
 }
 
-function protectedPasteExpression(value: string): string {
+function protectedPasteExpression(value: string, requireEmpty = true): string {
   const literal = JSON.stringify(value)
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
   return `(() => {
     const field = document.activeElement;
     const supported = field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement;
-    if (!supported || field.disabled || field.readOnly || field.value !== '') {
-      throw new Error('Protected paste target is not one focused empty editable field');
+    if (!supported || field.disabled || field.readOnly${requireEmpty ? " || field.value !== ''" : ''}) {
+      throw new Error('Protected paste target is not one focused editable field with the required value state');
     }
     if (field instanceof HTMLInputElement) {
       const allowed = new Set(['text', 'email', 'password', 'search', 'tel', 'url']);
@@ -578,7 +578,7 @@ export async function deliverProtectedClipboardPaste(
 
         const typed = await bridge.callTool(
           'evaluate',
-          { tabId, expression: protectedPasteExpression(value) },
+          { tabId, expression: protectedPasteExpression(value, false) },
           PROTECTED_PASTE_TIMEOUT_MS,
         );
         privateResults.push(typed);

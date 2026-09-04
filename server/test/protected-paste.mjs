@@ -104,6 +104,7 @@ assert.deepEqual(indexedObserved, [
 assert.match(indexedObserved[1].args.expression, /document\.activeElement/);
 assert.match(indexedObserved[1].args.expression, /dispatchEvent\(new Event\('input'/);
 assert.match(indexedObserved[1].args.expression, /return \{ pasted: true \}/);
+assert.doesNotMatch(indexedObserved[1].args.expression, /field\.value !== ''/);
 assert.equal(indexedObserved[1].args.expression.includes(indexedValue), true);
 assert.equal(indexedFocusResult.content[0].text, '');
 assert.equal(indexedPrivateResult.content[0].text, '');
