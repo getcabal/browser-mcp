@@ -530,6 +530,36 @@ function protectedPasteExpression(value: string, requireEmpty = true): string {
   })()`;
 }
 
+function protectedPastePoint(
+  args: Record<string, unknown>,
+  indexedTarget: unknown,
+): { xRatio: number; yRatio: number } | null {
+  const hasX = args.xRatio !== undefined;
+  const hasY = args.yRatio !== undefined;
+  if (!hasX && !hasY) return null;
+  if (!hasX || !hasY) {
+    throw new Error('Protected clipboard coordinate paste requires both xRatio and yRatio');
+  }
+  if (indexedTarget !== undefined) {
+    throw new Error('Protected clipboard paste accepts an index or coordinate ratios, not both');
+  }
+  const xRatio = args.xRatio;
+  const yRatio = args.yRatio;
+  if (
+    typeof xRatio !== 'number'
+    || typeof yRatio !== 'number'
+    || !Number.isFinite(xRatio)
+    || !Number.isFinite(yRatio)
+    || xRatio <= 0
+    || xRatio >= 1
+    || yRatio <= 0
+    || yRatio >= 1
+  ) {
+    throw new Error('Protected clipboard coordinate ratios must be finite numbers strictly between 0 and 1');
+  }
+  return { xRatio, yRatio };
+}
+
 export async function deliverProtectedClipboardPaste(
   bridge: ProtectedPasteBridge,
   args: Record<string, unknown>,
@@ -554,9 +584,15 @@ export async function deliverProtectedClipboardPaste(
   ) {
     throw new Error('Protected clipboard paste requires a positive snapshot index');
   }
+  const coordinateTarget = protectedPastePoint(args, indexedTarget);
   const sms = state?.takeSmsCode() ?? null;
   const stagedCredential = sms === null ? state?.takeCredential() ?? null : null;
-  const bytes = sms?.value ?? stagedCredential ?? (clipboardReader ? await clipboardReader() : null);
+  // Coordinates are an explicit fallback for renderer-opaque credential
+  // fields. Require the profile-local, one-use credential broker for this
+  // path; never source a coordinate-directed secret from ambient clipboard.
+  const bytes = sms?.value
+    ?? stagedCredential
+    ?? (coordinateTarget === null && clipboardReader ? await clipboardReader() : null);
   if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > CLIPBOARD_MAX_BYTES) {
     if (Buffer.isBuffer(bytes)) bytes.fill(0);
     throw new Error('Protected clipboard paste is unavailable');
@@ -574,6 +610,9 @@ export async function deliverProtectedClipboardPaste(
       throw new Error('Protected clipboard value is not valid UTF-8');
     }
     if (sms !== null) {
+      if (coordinateTarget !== null) {
+        throw new Error('Protected SMS paste requires an exact indexed or focused provider field');
+      }
       const privateResults: ToolResult[] = [];
       try {
         if (indexedTarget !== undefined) {
@@ -608,6 +647,32 @@ export async function deliverProtectedClipboardPaste(
         );
         privateResults.push(after);
         requirePrivateFlag(after, 'pasted', 'Protected SMS typing did not populate the exact field');
+      } finally {
+        for (const result of privateResults) scrubTextResult(result);
+      }
+    } else if (coordinateTarget !== null) {
+      // Some bank sign-in renderers expose no DOM or accessibility nodes even
+      // though their fields are present in a fresh page screenshot. Keep the
+      // focus click and one-use secret typing inside this broker call so the
+      // value never crosses the MCP response boundary and the path remains
+      // usable in a locked background session.
+      const privateResults: ToolResult[] = [];
+      try {
+        const focused = await bridge.callTool(
+          'click_at_ratio',
+          { tabId, ...coordinateTarget },
+          PROTECTED_PASTE_TIMEOUT_MS,
+        );
+        privateResults.push(focused);
+        if (focused.isError) throw new Error('Protected clipboard coordinate target could not be focused');
+
+        const typed = await bridge.callTool(
+          'type_text',
+          { tabId, text: value },
+          PROTECTED_PASTE_TIMEOUT_MS,
+        );
+        privateResults.push(typed);
+        if (typed.isError) throw new Error('Protected clipboard coordinate paste was refused');
       } finally {
         for (const result of privateResults) scrubTextResult(result);
       }

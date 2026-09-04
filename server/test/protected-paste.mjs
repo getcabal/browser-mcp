@@ -121,6 +121,80 @@ assert.deepEqual(indexedResult, {
 });
 assert.equal(indexedClipboard.every((byte) => byte === 0), true);
 
+const coordinateValue = 'local-test-coordinate-value';
+const coordinateState = new ProtectedPasteState();
+coordinateState.storeCredential(Buffer.from(coordinateValue, 'utf8'));
+const coordinateCalls = [];
+const coordinatePrivateResults = [];
+let coordinateClipboardReads = 0;
+const coordinateResult = await deliverProtectedClipboardPaste(
+  {
+    async callTool(name, args, timeoutMs) {
+      coordinateCalls.push({ name, args, timeoutMs });
+      const privateResult = {
+        content: [{ type: 'text', text: name === 'type_text' ? `Typed ${JSON.stringify(args.text)}` : 'focused' }],
+      };
+      coordinatePrivateResults.push(privateResult);
+      return privateResult;
+    },
+  },
+  { tabId: 18, keys: 'Meta+V', xRatio: 0.625, yRatio: 0.42 },
+  async () => {
+    coordinateClipboardReads += 1;
+    return Buffer.from('ambient-clipboard-must-not-be-read');
+  },
+  coordinateState,
+);
+assert.equal(coordinateClipboardReads, 0);
+assert.deepEqual(coordinateCalls.map((call) => call.name), ['click_at_ratio', 'type_text']);
+assert.deepEqual(coordinateCalls[0].args, { tabId: 18, xRatio: 0.625, yRatio: 0.42 });
+assert.equal(coordinateCalls[1].args.text, coordinateValue);
+assert.equal(coordinatePrivateResults.every((entry) => entry.content[0].text === ''), true);
+assert.equal(JSON.stringify(coordinateResult).includes(coordinateValue), false);
+assert.deepEqual(coordinateResult, {
+  content: [{ type: 'text', text: 'Pressed Meta+V' }],
+});
+assert.equal(coordinateState.takeCredential(), null);
+
+for (const args of [
+  { xRatio: 0.5 },
+  { yRatio: 0.5 },
+  { xRatio: 0, yRatio: 0.5 },
+  { xRatio: 1, yRatio: 0.5 },
+  { xRatio: 0.5, yRatio: -0.1 },
+  { xRatio: 0.5, yRatio: Number.NaN },
+  { xRatio: '0.5', yRatio: 0.5 },
+  { index: 20, xRatio: 0.5, yRatio: 0.5 },
+]) {
+  let invalidCoordinateClipboardReads = 0;
+  await assert.rejects(
+    () => deliverProtectedClipboardPaste(
+      bridge,
+      { tabId: 7, keys: 'Meta+V', ...args },
+      async () => {
+        invalidCoordinateClipboardReads += 1;
+        return Buffer.from('must-not-be-read');
+      },
+    ),
+    /coordinate|ratios/,
+  );
+  assert.equal(invalidCoordinateClipboardReads, 0);
+}
+
+let unstagedCoordinateClipboardReads = 0;
+await assert.rejects(
+  () => deliverProtectedClipboardPaste(
+    bridge,
+    { tabId: 7, keys: 'Meta+V', xRatio: 0.4, yRatio: 0.6 },
+    async () => {
+      unstagedCoordinateClipboardReads += 1;
+      return Buffer.from('must-not-be-read');
+    },
+  ),
+  /unavailable/,
+);
+assert.equal(unstagedCoordinateClipboardReads, 0);
+
 const brokerRoot = await mkdtemp(join(tmpdir(), 'profile-credential-broker-'));
 const brokerSocket = join(brokerRoot, 'credential.sock');
 const brokerState = new ProtectedPasteState();

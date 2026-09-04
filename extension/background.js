@@ -1081,6 +1081,36 @@ const executors = {
     return `Pressed ${args.keys}`;
   },
 
+  // Private server-only primitive used by the protected credential broker.
+  // Normalized viewport ratios make a fresh MCP screenshot usable without
+  // leaking OS-level coordinates or depending on an unlocked desktop.
+  async click_at_ratio(args) {
+    const tabId = requireTabId(args, 'click_at_ratio');
+    const xRatio = args.xRatio;
+    const yRatio = args.yRatio;
+    if (
+      typeof xRatio !== 'number'
+      || typeof yRatio !== 'number'
+      || !Number.isFinite(xRatio)
+      || !Number.isFinite(yRatio)
+      || xRatio <= 0
+      || xRatio >= 1
+      || yRatio <= 0
+      || yRatio >= 1
+    ) {
+      throw new Error('click_at_ratio requires finite xRatio and yRatio values strictly between 0 and 1');
+    }
+    const metrics = await cdp(tabId, 'Page.getLayoutMetrics', {});
+    const viewport = metrics.cssVisualViewport || metrics.cssLayoutViewport || metrics.layoutViewport;
+    const width = Number(viewport?.clientWidth || viewport?.width);
+    const height = Number(viewport?.clientHeight || viewport?.height);
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+      throw new Error('click_at_ratio could not resolve the current viewport');
+    }
+    await dispatchClick(tabId, { x: width * xRatio, y: height * yRatio });
+    return 'Focused protected coordinate target';
+  },
+
   async hover(args) {
     const tabId = requireTabId(args, 'hover');
     const target = await resolveUid(tabId, args.index);

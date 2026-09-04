@@ -199,6 +199,14 @@ annotated in tools/list):
 | `get_text` | — | `tabId` | Visible `innerText` of the page |
 | `evaluate` | `expression` | `tabId` | Evaluates a bare JS expression |
 
+The profile-local protected credential broker also accepts an internal
+renderer-opaque fallback on `press_key` with `keys="CMD+V"`: pass both
+`xRatio` and `yRatio` as finite viewport ratios strictly between 0 and 1,
+derived from the center of the exact field in a fresh Browser MCP screenshot.
+It is mutually exclusive with `index`, requires a one-use broker-staged
+credential, and keeps both the click and secret typing inside the browser
+bridge. It is not part of the advertised Vibe compatibility contract.
+
 ### The uid workflow
 
 Call `take_snapshot` before interacting with elements. It returns compact
