@@ -8,6 +8,7 @@ import {
   deliverProtectedClipboardPaste,
   isProtectedPasteCall,
   isProtectedSmsCaptureCall,
+  protectedSmsProvider,
   ProfileCredentialBroker,
   ProtectedPasteState,
 } from '../dist/protected-paste.js';
@@ -31,8 +32,14 @@ assert.equal(isProtectedPasteCall('press_key', { tabId: 7, keys: 'Meta+V', index
 assert.equal(isProtectedPasteCall('evaluate', { tabId: 7, keys: 'Meta+V' }), false);
 assert.equal(isProtectedSmsCaptureCall('press_key', { tabId: 9, keys: 'Meta+Shift+C' }), true);
 assert.equal(isProtectedSmsCaptureCall('press_key', { tabId: 9, keys: ' Command + Shift + C ' }), true);
+assert.equal(isProtectedSmsCaptureCall('press_key', { tabId: 9, keys: 'Meta+Shift+P' }), true);
+assert.equal(isProtectedSmsCaptureCall('press_key', { tabId: 9, keys: ' Command + Shift + H ' }), true);
 assert.equal(isProtectedSmsCaptureCall('press_key', { tabId: 9, keys: 'Meta+C' }), false);
 assert.equal(isProtectedSmsCaptureCall('press_key', { tabId: 9, keys: 'Meta+Shift+C', index: 1 }), false);
+assert.equal(protectedSmsProvider({ keys: 'Meta+Shift+C' }), 'servicetitan');
+assert.equal(protectedSmsProvider({ keys: 'Meta+Shift+P' }), 'paylocity');
+assert.equal(protectedSmsProvider({ keys: 'Meta+Shift+H' }), 'chase');
+assert.equal(protectedSmsProvider({ keys: 'Meta+Shift+X' }), null);
 
 const dummyValue = 'local-test-clipboard-value';
 const clipboard = Buffer.from(dummyValue, 'utf8');
@@ -287,7 +294,7 @@ assert.deepEqual(smsPasteObserved.map((call) => call.name), [
 ]);
 assert.equal(smsPasteObserved.every((call) => call.args.tabId === 11), true);
 assert.match(smsPasteObserved[0].args.expression, /login\.servicetitan\.com/);
-assert.match(smsPasteObserved[0].args.expression, /field\.name !== 'sms-code'/);
+assert.match(smsPasteObserved[0].args.expression, /field\.name === 'sms-code'/);
 assert.match(smsPasteObserved[0].args.expression, /\['text', 'tel', 'number'\]/);
 assert.match(smsPasteObserved[0].args.expression, /field\.value !== ''/);
 assert.doesNotMatch(smsPasteObserved[0].args.expression, new RegExp(dummyCode));
@@ -298,6 +305,78 @@ assert.equal(smsBeforeResult.content[0].text, '');
 assert.equal(smsTypedResult.content[0].text, '');
 assert.equal(smsAfterResult.content[0].text, '');
 assert.equal(JSON.stringify(smsPasteResult).includes(dummyCode), false);
+
+for (const providerCase of [
+  {
+    chord: 'Meta+Shift+P',
+    code: '54321',
+    capturePattern: /paylocity/,
+    targetPattern: /one\[- \]\?time\.\*passcode/,
+    expectedPattern: /\\d\{5\}/,
+  },
+  {
+    chord: 'Meta+Shift+H',
+    code: '87654321',
+    capturePattern: /chase/,
+    targetPattern: /identification\.\*code/,
+    expectedPattern: /\\d\{8\}/,
+  },
+]) {
+  const providerState = new ProtectedPasteState();
+  const providerPrivateCapture = {
+    content: [{ type: 'text', text: JSON.stringify({ code: providerCase.code }) }],
+  };
+  let providerCaptureCall = null;
+  const providerCaptureResult = await captureProtectedServiceTitanSms(
+    {
+      async callTool(name, args, timeoutMs) {
+        providerCaptureCall = { name, args, timeoutMs };
+        return providerPrivateCapture;
+      },
+    },
+    { tabId: 21, keys: providerCase.chord },
+    providerState,
+  );
+  assert.equal(providerCaptureCall.name, 'evaluate');
+  assert.match(providerCaptureCall.args.expression, providerCase.capturePattern);
+  assert.equal(providerPrivateCapture.content[0].text, '');
+  assert.equal(JSON.stringify(providerCaptureResult).includes(providerCase.code), false);
+
+  const providerPasteCalls = [];
+  const privateResults = [];
+  const providerPasteResult = await deliverProtectedClipboardPaste(
+    {
+      async callTool(name, args, timeoutMs) {
+        providerPasteCalls.push({ name, args, timeoutMs });
+        const evaluateCount = providerPasteCalls.filter((call) => call.name === 'evaluate').length;
+        const result = name === 'click'
+          ? { content: [{ type: 'text', text: 'focused' }] }
+          : name === 'type_text'
+            ? { content: [{ type: 'text', text: 'typed' }] }
+            : { content: [{ type: 'text', text: evaluateCount === 1 ? '{"ready":true}' : '{"pasted":true}' }] };
+        privateResults.push(result);
+        return result;
+      },
+    },
+    { tabId: 22, keys: 'Meta+V', index: 31 },
+    async () => {
+      throw new Error('protected SMS paste must not read the system clipboard');
+    },
+    providerState,
+  );
+  assert.deepEqual(providerPasteCalls.map((call) => call.name), [
+    'click',
+    'evaluate',
+    'type_text',
+    'evaluate',
+  ]);
+  assert.deepEqual(providerPasteCalls[0].args, { tabId: 22, uid: 31 });
+  assert.match(providerPasteCalls[1].args.expression, providerCase.targetPattern);
+  assert.match(providerPasteCalls[3].args.expression, providerCase.expectedPattern);
+  assert.equal(providerPasteCalls[2].args.text, providerCase.code);
+  assert.equal(privateResults.every((result) => result.content[0].text === ''), true);
+  assert.equal(JSON.stringify(providerPasteResult).includes(providerCase.code), false);
+}
 
 const invalidCaptureResult = {
   content: [{ type: 'text', text: '{"code":"not-six-digits"}' }],
@@ -329,4 +408,4 @@ assert.equal(overbroadCaptureResult.content[0].text, '');
 assert.equal(smsState.takeSmsCode(), null);
 smsState.clear();
 
-console.log('protected paste: exact credential paste and one-use ServiceTitan SMS bridge ok');
+console.log('protected paste: exact credential paste and one-use provider SMS bridge ok');
