@@ -6,7 +6,7 @@
  * two local-only conveniences beyond that compatibility boundary.
  */
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.2.1';
 export const PROTOCOL_VERSION = 2;
 
 export interface ToolAnnotations {

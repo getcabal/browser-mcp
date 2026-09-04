@@ -315,6 +315,29 @@ try {
   await call('type_text', { text: ' there', tabId: tabA });
   assert.equal(await call('evaluate_script', { function: "() => document.querySelector('#name').value", tabId: tabA }), 'Hi there');
 
+  // The protected credential broker's private coordinate primitive focuses a
+  // screenshot-derived field inside the extension. It is intentionally absent
+  // from the public MCP contract, but must remain live for renderer-opaque
+  // sign-in forms such as Chase.
+  const coordinateTarget = JSON.parse(await call('evaluate_script', {
+    function: `() => {
+      const field = document.querySelector('#email');
+      field.value = '';
+      const rect = field.getBoundingClientRect();
+      return {
+        xRatio: (rect.left + rect.width / 2) / window.innerWidth,
+        yRatio: (rect.top + rect.height / 2) / window.innerHeight,
+      };
+    }`,
+    tabId: tabA,
+  }));
+  await call('click_at_ratio', { tabId: tabA, ...coordinateTarget });
+  await call('type_text', { text: 'coordinate-entry', tabId: tabA });
+  assert.equal(
+    await call('evaluate_script', { function: "() => document.querySelector('#email').value", tabId: tabA }),
+    'coordinate-entry',
+  );
+
   // hover fires mouseover on the target.
   await call('hover', { index: Number(dragBUid.replace('@e', '')), duration: 100, tabId: tabA });
   // drag delivers mousedown on the source and mouseup on the target.
