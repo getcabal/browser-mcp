@@ -442,17 +442,25 @@ function protectedSmsTargetExpression(
 ): string {
   const providerLiteral = JSON.stringify(provider);
   return `(() => {
-    const field = document.activeElement;
+    let field = document.activeElement;
+    while (field) {
+      const next = field.shadowRoot?.activeElement
+        || (field.tagName === 'IFRAME' && field.contentDocument?.activeElement);
+      if (!next) break;
+      field = next;
+    }
+    const view = field?.ownerDocument.defaultView;
+    if (!view || view.location.origin !== location.origin) throw new Error('Protected SMS target origin was refused');
     const provider = ${providerLiteral};
     const hostname = location.hostname.toLowerCase();
-    const label = field instanceof HTMLInputElement
+    const label = field instanceof view.HTMLInputElement
       ? [field.getAttribute('aria-label'), field.name, field.id, field.placeholder].filter(Boolean).join(' ')
       : '';
     const exactTarget = provider === 'servicetitan'
-      ? hostname === 'login.servicetitan.com' && location.pathname.startsWith('/mfa') && field instanceof HTMLInputElement && field.name === 'sms-code'
+      ? hostname === 'login.servicetitan.com' && location.pathname.startsWith('/mfa') && field instanceof view.HTMLInputElement && field.name === 'sms-code'
       : provider === 'paylocity'
-        ? (hostname === 'paylocity.com' || hostname.endsWith('.paylocity.com')) && field instanceof HTMLInputElement && /(?:one[- ]?time.*passcode|passcode|verification.*code)/i.test(label)
-        : (hostname === 'chase.com' || hostname.endsWith('.chase.com')) && field instanceof HTMLInputElement && /(?:identification.*code|verification.*code|one[- ]?time.*code|code)/i.test(label);
+        ? (hostname === 'paylocity.com' || hostname.endsWith('.paylocity.com')) && field instanceof view.HTMLInputElement && /(?:one[- ]?time.*passcode|passcode|verification.*code)/i.test(label)
+        : (hostname === 'chase.com' || hostname.endsWith('.chase.com')) && field instanceof view.HTMLInputElement && /(?:identification.*code|verification.*code|one[- ]?time.*code|code)/i.test(label);
     if (!exactTarget) {
       throw new Error('Protected SMS target is not the exact provider MFA field');
     }
@@ -463,10 +471,14 @@ function protectedSmsTargetExpression(
     if (!allowed.has(String(field.type || 'text').toLowerCase())) {
       throw new Error('Protected SMS target input type is unsupported');
     }
-    const style = getComputedStyle(field);
-    const rect = field.getBoundingClientRect();
-    if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) {
-      throw new Error('Protected SMS target is not visible');
+    for (let element = field; element; element = element.ownerDocument.defaultView.frameElement) {
+      const elementView = element.ownerDocument.defaultView;
+      if (elementView.location.origin !== location.origin) throw new Error('Protected SMS target origin was refused');
+      const style = elementView.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) {
+        throw new Error('Protected SMS target is not visible');
+      }
     }
     const expected = provider === 'servicetitan' ? /^\\d{6}$/ : provider === 'paylocity' ? /^\\d{5}$/ : /^\\d{8}$/;
     if (${populated ? "!expected.test(field.value)" : "field.value !== ''"}) {
@@ -677,32 +689,20 @@ export async function deliverProtectedClipboardPaste(
         for (const result of privateResults) scrubTextResult(result);
       }
     } else if (indexedTarget !== undefined) {
-      // Snapshot UIDs resolve through CDP's backend-node mapping, so this
-      // reaches exact fields inside iframes and shadow roots without ever
-      // exposing the protected value to the MCP client. Focus the exact node
-      // and immediately apply the native value setter plus input/change events
-      // in the same broker call. Keeping those operations adjacent avoids the
-      // focus race that occurs when credential staging is a separate process.
-      // The caller must pass an exact positive index from fresh page state.
-      const privateResults: ToolResult[] = [];
+      // Resolve and focus/replace the exact node in one element-bound call.
+      // The private fill result and secret never cross the MCP response boundary.
+      let result: ToolResult | undefined;
       try {
-        const focused = await bridge.callTool(
-          'click',
-          { tabId, uid: indexedTarget },
+        result = await bridge.callTool(
+          'fill',
+          { tabId, uid: indexedTarget, value, protectedEntry: true },
           PROTECTED_PASTE_TIMEOUT_MS,
         );
-        privateResults.push(focused);
-        if (focused.isError) throw new Error('Protected clipboard target could not be focused');
-
-        const typed = await bridge.callTool(
-          'evaluate',
-          { tabId, expression: protectedPasteExpression(value, false) },
-          PROTECTED_PASTE_TIMEOUT_MS,
-        );
-        privateResults.push(typed);
-        requirePrivateFlag(typed, 'pasted', 'Protected clipboard paste was refused');
+        requirePrivateFlag(result, 'pasted', 'Protected clipboard paste was refused');
+      } catch {
+        throw new Error('Protected clipboard indexed paste was refused');
       } finally {
-        for (const result of privateResults) scrubTextResult(result);
+        if (result) scrubTextResult(result);
       }
     } else {
       const result = await bridge.callTool(

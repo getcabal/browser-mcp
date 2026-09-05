@@ -12,6 +12,7 @@ import { createServer } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { deliverProtectedClipboardPaste } from '../dist/protected-paste.js';
 import { LocalExtensionBridge } from '../dist/bridge.js';
 import { freePort, sleep } from './fake-extension.mjs';
 
@@ -133,7 +134,10 @@ const bridge = new LocalExtensionBridge({
 });
 await bridge.start();
 
-const pages = { '/': INDEX_HTML, '/index.html': INDEX_HTML, '/page2.html': PAGE2_HTML };
+const pages = {
+  '/frames.html': '<!doctype html><title>Frame shell</title><p>Loading</p><iframe title="logon" src="/logon.html"></iframe>',
+  '/logon.html': '<!doctype html><label>Frame username<input id="user" value="old"></label><label>Frame password<input type="password"></label><button onclick="document.body.dataset.clicked=1">Frame sign in</button>',
+  '/': INDEX_HTML, '/index.html': INDEX_HTML, '/page2.html': PAGE2_HTML };
 const httpServer = createServer((req, res) => {
   const path = new URL(req.url, 'http://127.0.0.1').pathname;
   const body = pages[path];
@@ -261,6 +265,29 @@ try {
   for (const line of listing.split('\n').slice(1)) {
     assert.match(line, /^Page\s+\d+\s*(\[ACTIVE\])?\s*: ".*" - .+$/, `list_pages line format: ${line}`);
   }
+
+  // A same-origin frame exposes exact indexes in both workflow snapshot formats.
+  const framePage = await call('new_page', { url: `${baseUrl}/frames.html` });
+  const frameTab = Number(framePage.match(/Tab ID: (\d+)/)[1]);
+  for (const format of ['markdown', 'accessibility_tree']) {
+    const frameSnapshot = await call('take_snapshot', { tabId: frameTab, format });
+    const userUid = uidByName(frameSnapshot, 'Frame username', 'textbox');
+    uidByName(frameSnapshot, 'Frame password', 'textbox');
+    const buttonUid = uidByName(frameSnapshot, 'Frame sign in', 'button');
+    const bytes = Buffer.from('synthetic-frame-entry');
+    const receipt = await deliverProtectedClipboardPaste(bridge,
+      { tabId: frameTab, keys: 'Meta+V', index: Number(userUid.slice(2)) }, async () => bytes);
+    assert.equal(text(receipt), 'Pressed Meta+V');
+    assert.ok(bytes.every(byte => byte === 0));
+    assert.equal(await call('evaluate_script', { tabId: frameTab, function: `() => {
+      const doc = document.querySelector('iframe').contentDocument;
+      return doc.activeElement === doc.querySelector('#user') && doc.querySelector('#user').value === 'synthetic-frame-entry';
+    }` }), 'true');
+    await call('click', { tabId: frameTab, uid: buttonUid });
+    assert.equal(await call('evaluate_script', { tabId: frameTab,
+      function: "() => document.querySelector('iframe').contentDocument.body.dataset.clicked === '1'" }), 'true');
+  }
+  await call('close_page', { pageId: frameTab });
 
   // take_snapshot supports the exact Vibe options and assigns @eN uids.
   const semanticSnapshot = await call('take_snapshot', { pageId: tabA, format: 'accessibility_tree', compact: true, maxDepth: 20 });

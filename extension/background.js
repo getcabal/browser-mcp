@@ -503,7 +503,41 @@ async function accessibilityNodes(tabId, { maxDepth, scopeSelector } = {}) {
   if (typeof maxDepth === 'number' && Number.isFinite(maxDepth) && maxDepth > 0) {
     params.depth = Math.floor(maxDepth);
   }
-  return (await cdp(tabId, 'Accessibility.getFullAXTree', params)).nodes || [];
+  const { frameTree } = await cdp(tabId, 'Page.getFrameTree');
+  const nodes = [];
+  const seen = new Set();
+  const visit = async (tree, parentId) => {
+    const frameId = tree.frame.id;
+    if (parentId) {
+      if (!tree.frame.securityOrigin || tree.frame.securityOrigin !== frameTree.frame.securityOrigin) return;
+      const owner = await cdp(tabId, 'DOM.getFrameOwner', { frameId });
+      const visible = await callOnElement(tabId, owner.backendNodeId, `function() {
+        return !!this.contentDocument && !!this.getClientRects().length
+          && this.ownerDocument.defaultView.getComputedStyle(this).visibility !== 'hidden';
+      }`);
+      if (!visible) return;
+    }
+    const result = await cdp(tabId, 'Accessibility.getFullAXTree', { ...params, frameId });
+    for (const node of result.nodes || []) {
+      if (seen.has(node.backendDOMNodeId)) continue;
+      if (typeof node.backendDOMNodeId === 'number') seen.add(node.backendDOMNodeId);
+      nodes.push({ ...node, frameId, nodeId: `${frameId}:${node.nodeId}`,
+        parentId: node.parentId ? `${frameId}:${node.parentId}` : undefined });
+    }
+    for (const child of tree.childFrames || []) {
+      try {
+        await visit(child, frameId);
+      } catch (error) {
+        // Only suppress a child failure when it actually left the frame tree.
+        const { frameTree: currentTree } = await cdp(tabId, 'Page.getFrameTree');
+        const containsChild = (entry) => entry.frame.id === child.frame.id
+          || (entry.childFrames || []).some(containsChild);
+        if (currentTree.frame.id !== frameTree.frame.id || containsChild(currentTree)) throw error;
+      }
+    }
+  };
+  await visit(frameTree);
+  return nodes;
 }
 
 function hashText(text) {
@@ -571,7 +605,7 @@ async function takeSnapshotFor(tabId, options = {}) {
     if (typeof node.backendDOMNodeId !== 'number') continue;
     counter += 1;
     const uid = `@e${counter}`;
-    refs.set(uid, { backendNodeId: node.backendDOMNodeId, role, name });
+    refs.set(uid, { backendNodeId: node.backendDOMNodeId, role, name, frameId: node.frameId });
     if (lines.length < MAX_SNAPSHOT_LINES) {
       const depth = depthFor(node);
       if (format === 'markdown') lines.push(`${uid} [${role}] ${JSON.stringify(outputName)}`);
@@ -629,7 +663,7 @@ function normalizeUid(raw) {
 
 async function relocate(tabId, entry) {
   try {
-    const { nodes } = await cdp(tabId, 'Accessibility.getFullAXTree', {});
+    const { nodes } = await cdp(tabId, 'Accessibility.getFullAXTree', entry.frameId ? { frameId: entry.frameId } : {});
     const matches = (nodes || []).filter((node) => !node.ignored
       && node.role?.value === entry.role
       && (node.name?.value || '') === entry.name
@@ -639,7 +673,7 @@ async function relocate(tabId, entry) {
   return null;
 }
 
-async function resolveUid(tabId, rawUid) {
+async function resolveUid(tabId, rawUid, allowRelocate = true) {
   const uid = normalizeUid(rawUid);
   const refs = snapshots.get(tabId);
   if (!refs) throw new Error(`No snapshot for tab ${tabId}; call take_snapshot first`);
@@ -649,7 +683,7 @@ async function resolveUid(tabId, rawUid) {
     await cdp(tabId, 'DOM.describeNode', { backendNodeId: entry.backendNodeId });
     return entry.backendNodeId;
   } catch {
-    const relocated = await relocate(tabId, entry);
+    const relocated = allowRelocate ? await relocate(tabId, entry) : null;
     if (relocated) {
       entry.backendNodeId = relocated;
       return relocated;
@@ -823,29 +857,52 @@ async function dispatchChord(tabId, chord) {
 // Element value helpers
 // ---------------------------------------------------------------------------
 
-const SET_VALUE_FN = `function(value) {
+const SET_VALUE_FN = `function(value, protectedEntry = false) {
+  const doc = this.ownerDocument;
+  const view = doc.defaultView;
+  if (protectedEntry) {
+    const supported = this instanceof view.HTMLInputElement || this instanceof view.HTMLTextAreaElement;
+    if (!this.isConnected || !supported || this.disabled || this.readOnly
+      || (this instanceof view.HTMLInputElement && !['text', 'email', 'password', 'search', 'tel', 'url'].includes(this.type))) {
+      throw new Error('Protected paste target is not editable');
+    }
+    // Check each containing frame as well as the exact field before focus.
+    for (let element = this; element; element = element.ownerDocument.defaultView.frameElement) {
+      const style = element.ownerDocument.defaultView.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) {
+        throw new Error('Protected paste target is not visible');
+      }
+    }
+    this.focus();
+    if ((this.getRootNode().activeElement || doc.activeElement) !== this) {
+      throw new Error('Protected paste target could not be focused');
+    }
+  }
   const tag = (this.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea') {
-    const proto = tag === 'input' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+    const proto = tag === 'input' ? view.HTMLInputElement.prototype : view.HTMLTextAreaElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
     setter.call(this, value);
-    this.dispatchEvent(new Event('input', { bubbles: true }));
-    this.dispatchEvent(new Event('change', { bubbles: true }));
+    this.dispatchEvent(new view.Event('input', { bubbles: true }));
+    this.dispatchEvent(new view.Event('change', { bubbles: true }));
   } else if (tag === 'select') {
     this.value = value;
-    this.dispatchEvent(new Event('input', { bubbles: true }));
-    this.dispatchEvent(new Event('change', { bubbles: true }));
+    this.dispatchEvent(new view.Event('input', { bubbles: true }));
+    this.dispatchEvent(new view.Event('change', { bubbles: true }));
   } else if (this.isContentEditable) {
     this.focus();
-    document.execCommand('selectAll', false, null);
-    document.execCommand('insertText', false, value);
+    doc.execCommand('selectAll', false, null);
+    doc.execCommand('insertText', false, value);
   } else {
     throw new Error('Element is not an input, textarea, select, or editable element');
   }
+  if (protectedEntry && this.value.length === 0) throw new Error('Protected paste did not populate the target');
+  return { pasted: true };
 }`;
 
-async function setElementValue(tabId, backendNodeId, value) {
-  await callOnElement(tabId, backendNodeId, SET_VALUE_FN, [value]);
+async function setElementValue(tabId, backendNodeId, value, protectedEntry = false) {
+  return callOnElement(tabId, backendNodeId, SET_VALUE_FN, [value, protectedEntry]);
 }
 
 async function dispatchClick(tabId, point, modifiers = 0) {
@@ -963,9 +1020,10 @@ const executors = {
   async fill(args) {
     const tabId = requireTabId(args, 'fill');
     if (typeof args.value !== 'string') throw new Error('fill requires a string value');
-    const target = await resolveUid(tabId, args.uid);
-    await setElementValue(tabId, target, args.value);
-    return `Filled ${normalizeUid(args.uid)}`;
+    const protectedEntry = args.protectedEntry === true;
+    const target = await resolveUid(tabId, args.uid, !protectedEntry);
+    const result = await setElementValue(tabId, target, args.value, protectedEntry);
+    return protectedEntry ? result : `Filled ${normalizeUid(args.uid)}`;
   },
 
   async fill_form(args) {

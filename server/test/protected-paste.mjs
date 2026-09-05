@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -75,16 +76,13 @@ const indexedClipboard = Buffer.from(indexedValue, 'utf8');
 const indexedPrivateResult = {
   content: [{ type: 'text', text: '{"pasted":true}' }],
 };
-const indexedFocusResult = {
-  content: [{ type: 'text', text: 'Clicked @e20' }],
-};
 const indexedObserved = [];
 let indexedClipboardClears = 0;
 const indexedResult = await deliverProtectedClipboardPaste(
   {
     async callTool(name, args, timeoutMs) {
       indexedObserved.push({ name, args, timeoutMs });
-      return name === 'click' ? indexedFocusResult : indexedPrivateResult;
+      return indexedPrivateResult;
     },
   },
   { tabId: 7, keys: 'Meta+V', index: 20 },
@@ -93,33 +91,35 @@ const indexedResult = await deliverProtectedClipboardPaste(
   async () => { indexedClipboardClears += 1; },
 );
 assert.equal(indexedClipboardClears, 1);
-assert.deepEqual(indexedObserved, [
-  {
-    name: 'click',
-    args: { tabId: 7, uid: 20 },
-    timeoutMs: 15_000,
-  },
-  {
-    name: 'evaluate',
-    args: {
-      tabId: 7,
-      expression: indexedObserved[1].args.expression,
-    },
-    timeoutMs: 15_000,
-  },
-]);
-assert.match(indexedObserved[1].args.expression, /document\.activeElement/);
-assert.match(indexedObserved[1].args.expression, /dispatchEvent\(new Event\('input'/);
-assert.match(indexedObserved[1].args.expression, /return \{ pasted: true \}/);
-assert.doesNotMatch(indexedObserved[1].args.expression, /field\.value !== ''/);
-assert.equal(indexedObserved[1].args.expression.includes(indexedValue), true);
-assert.equal(indexedFocusResult.content[0].text, '');
+assert.deepEqual(indexedObserved, [{
+  name: 'fill',
+  args: { tabId: 7, uid: 20, value: indexedValue, protectedEntry: true },
+  timeoutMs: 15_000,
+}]);
 assert.equal(indexedPrivateResult.content[0].text, '');
 assert.equal(JSON.stringify(indexedResult).includes(indexedValue), false);
 assert.deepEqual(indexedResult, {
   content: [{ type: 'text', text: 'Pressed Meta+V' }],
 });
 assert.equal(indexedClipboard.every((byte) => byte === 0), true);
+
+// Refused/stale indexed targets cannot fall through to typing or expose errors.
+for (const throws of [false, true]) {
+  const bytes = Buffer.from('synthetic-refused-secret');
+  const refused = { isError: true, content: [{ type: 'text', text: 'private-page-error' }] };
+  const calls = [];
+  await assert.rejects(deliverProtectedClipboardPaste({
+    async callTool(name) {
+      calls.push(name);
+      if (throws) throw new Error('private-page-error');
+      return refused;
+    },
+  }, { tabId: 7, keys: 'Meta+V', index: 999 }, async () => bytes),
+  /^Error: Protected clipboard indexed paste was refused$/);
+  assert.deepEqual(calls, ['fill']);
+  assert.ok(bytes.every(byte => byte === 0));
+  if (!throws) assert.equal(refused.content[0].text, '');
+}
 
 const coordinateValue = 'local-test-coordinate-value';
 const coordinateState = new ProtectedPasteState();
@@ -210,13 +210,12 @@ try {
   assert.equal(String(await socketExchange(brokerSocket, brokerFrame)), 'STAGED\n');
   let brokerClipboardReads = 0;
   const brokerObserved = [];
-  const brokerFocusResult = { content: [{ type: 'text', text: 'focused' }] };
   const brokerTypedResult = { content: [{ type: 'text', text: '{"pasted":true}' }] };
   const brokerPasteResult = await deliverProtectedClipboardPaste(
     {
       async callTool(name, args, timeoutMs) {
         brokerObserved.push({ name, args, timeoutMs });
-        return name === 'click' ? brokerFocusResult : brokerTypedResult;
+        return brokerTypedResult;
       },
     },
     { tabId: 12, keys: 'Meta+V', index: 4 },
@@ -227,11 +226,10 @@ try {
     brokerState,
   );
   assert.equal(brokerClipboardReads, 0);
-  assert.deepEqual(brokerObserved.map((call) => call.name), ['click', 'evaluate']);
+  assert.deepEqual(brokerObserved.map((call) => call.name), ['fill']);
   assert.equal(brokerObserved[0].args.uid, 4);
-  assert.match(brokerObserved[1].args.expression, /return \{ pasted: true \}/);
-  assert.equal(brokerObserved[1].args.expression.includes('profile-local-value'), true);
-  assert.equal(brokerFocusResult.content[0].text, '');
+  assert.equal(brokerObserved[0].args.protectedEntry, true);
+  assert.equal(brokerObserved[0].args.value, 'profile-local-value');
   assert.equal(brokerTypedResult.content[0].text, '');
   assert.deepEqual(brokerPasteResult, {
     content: [{ type: 'text', text: 'Pressed Meta+V' }],
@@ -448,6 +446,56 @@ for (const providerCase of [
   assert.match(providerPasteCalls[1].args.expression, providerCase.targetPattern);
   assert.match(providerPasteCalls[3].args.expression, providerCase.expectedPattern);
   assert.equal(providerPasteCalls[2].args.text, providerCase.code);
+  if (providerCase.chord === 'Meta+Shift+H') {
+    const frame = vm.createContext({});
+    vm.runInContext(`
+      class HTMLInputElement {}
+      const location = { origin: 'https://secure.chase.com', hostname: 'secure.chase.com', pathname: '/login' };
+      const topView = { location, frameElement: null,
+        getComputedStyle: element => element.style || ({display: 'block', visibility: 'visible'}) };
+      const outerFrame = { tagName: 'IFRAME', ownerDocument: {defaultView: topView},
+        getBoundingClientRect: () => ({width: 500, height: 300}) };
+      const middleView = { ...topView, frameElement: outerFrame };
+      const innerFrame = { tagName: 'IFRAME', ownerDocument: {defaultView: middleView},
+        getBoundingClientRect: () => ({width: 300, height: 100}) };
+      const view = { ...topView, HTMLInputElement, frameElement: innerFrame };
+      const field = new HTMLInputElement();
+      Object.assign(field, { ownerDocument: {defaultView: view}, name: 'identification-code', type: 'text', value: '',
+        getAttribute: () => null, getBoundingClientRect: () => ({width: 100, height: 30}) });
+      innerFrame.contentDocument = {activeElement: field};
+      outerFrame.contentDocument = {activeElement: innerFrame};
+      const document = {activeElement: outerFrame};
+      globalThis.field = field;
+      globalThis.containingFrames = [innerFrame, outerFrame];
+    `, frame);
+    assert.equal(vm.runInContext(providerPasteCalls[1].args.expression, frame).ready, true);
+    frame.field.value = providerCase.code;
+    assert.equal(vm.runInContext(providerPasteCalls[3].args.expression, frame).pasted, true);
+    // Both preflight and post-paste checks reject any hidden containing frame,
+    // even though the nested field still reports a visible rectangle and style.
+    for (const containingFrame of frame.containingFrames) {
+      const visibleRect = containingFrame.getBoundingClientRect;
+      for (const hidden of [
+        { style: {display: 'none', visibility: 'visible'} },
+        { style: {display: 'block', visibility: 'hidden'} },
+        { rect: {width: 0, height: 100} },
+        { rect: {width: 100, height: 0} },
+      ]) {
+        containingFrame.style = hidden.style;
+        containingFrame.getBoundingClientRect = hidden.rect ? () => hidden.rect : visibleRect;
+        frame.field.value = '';
+        assert.throws(() => vm.runInContext(providerPasteCalls[1].args.expression, frame), /not visible/);
+        frame.field.value = providerCase.code;
+        assert.throws(() => vm.runInContext(providerPasteCalls[3].args.expression, frame), /not visible/);
+      }
+      containingFrame.style = undefined;
+      containingFrame.getBoundingClientRect = visibleRect;
+    }
+    assert.equal(vm.runInContext(providerPasteCalls[3].args.expression, frame).pasted, true);
+    frame.field.ownerDocument.defaultView.location = {origin: 'https://other.test'};
+    assert.throws(() => vm.runInContext(providerPasteCalls[3].args.expression, frame), /origin was refused/);
+  }
+
   assert.equal(privateResults.every((result) => result.content[0].text === ''), true);
   assert.equal(JSON.stringify(providerPasteResult).includes(providerCase.code), false);
 }
