@@ -156,6 +156,53 @@ assert.deepEqual(coordinateResult, {
 });
 assert.equal(coordinateState.takeCredential(), null);
 
+// Classify only exact known focus errors before scrubbing; never echo private data.
+for (const [text, category] of [
+  ['Error: Unknown tool: click_at_ratio', 'primitive_unavailable'],
+  ['Error: click_at_ratio could not resolve the current viewport', 'viewport_unavailable'],
+  ['private-error INERT-DIAGNOSTIC-VALUE tab=18 xRatio=0.625 snapshot', 'extension_error'],
+  ['Error: Unknown tool: click_at_ratio private-suffix', 'extension_error'],
+  ['', 'extension_error'],
+]) {
+  const state = new ProtectedPasteState();
+  state.storeCredential(Buffer.from('INERT-DIAGNOSTIC-VALUE'));
+  let consumed;
+  const take = state.takeCredential.bind(state);
+  state.takeCredential = () => (consumed = take());
+  const refused = { isError: true, content: [{ type: 'text', text }] };
+  const calls = [];
+  await assert.rejects(deliverProtectedClipboardPaste({
+    async callTool(name) { calls.push(name); return refused; },
+  }, { tabId: 18, keys: 'CMD+V', xRatio: 0.625, yRatio: 0.42 },
+  async () => { throw new Error('must not read clipboard'); }, state),
+  { message: `Protected clipboard coordinate target could not be focused (${category})` });
+  assert.deepEqual(calls, ['click_at_ratio']);
+  assert.ok(consumed.every(byte => byte === 0));
+  assert.equal(take(), null);
+  assert.equal(refused.content[0].text, '');
+}
+
+// Bridge rejection has no private result to scrub and must not expose its error.
+{
+  const state = new ProtectedPasteState();
+  state.storeCredential(Buffer.from('INERT-DIAGNOSTIC-VALUE'));
+  const take = state.takeCredential.bind(state);
+  let consumed;
+  state.takeCredential = () => (consumed = take());
+  const calls = [];
+  await assert.rejects(deliverProtectedClipboardPaste({
+    async callTool(name) {
+      calls.push(name);
+      throw new Error('private-transport-error INERT-DIAGNOSTIC-VALUE tab=18');
+    },
+  }, { tabId: 18, keys: 'CMD+V', xRatio: 0.625, yRatio: 0.42 },
+  async () => { throw new Error('must not read clipboard'); }, state),
+  { message: 'Protected clipboard coordinate target could not be focused (bridge_error)' });
+  assert.deepEqual(calls, ['click_at_ratio']);
+  assert.ok(consumed.every(byte => byte === 0));
+  assert.equal(take(), null);
+}
+
 for (const args of [
   { xRatio: 0.5 },
   { yRatio: 0.5 },

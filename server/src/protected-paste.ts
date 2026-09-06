@@ -674,9 +674,20 @@ export async function deliverProtectedClipboardPaste(
           'click_at_ratio',
           { tabId, ...coordinateTarget },
           PROTECTED_PASTE_TIMEOUT_MS,
-        );
+        ).catch(() => {
+          throw new Error('Protected clipboard coordinate target could not be focused (bridge_error)');
+        });
         privateResults.push(focused);
-        if (focused.isError) throw new Error('Protected clipboard coordinate target could not be focused');
+        if (focused.isError) {
+          // Only fixed categories cross the boundary; classify before finally scrubs.
+          const text = focused.content.length === 1 && focused.content[0].type === 'text'
+            ? focused.content[0].text : undefined;
+          const category = text === 'Error: Unknown tool: click_at_ratio'
+            ? 'primitive_unavailable'
+            : text === 'Error: click_at_ratio could not resolve the current viewport'
+              ? 'viewport_unavailable' : 'extension_error';
+          throw new Error(`Protected clipboard coordinate target could not be focused (${category})`);
+        }
 
         const typed = await bridge.callTool(
           'type_text',
