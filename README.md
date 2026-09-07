@@ -427,3 +427,7 @@ npm run clean     # Remove server/dist and dist
 
 Apache-2.0. See [LICENSE](LICENSE). Legal attribution in the license is retained
 for provenance; it is not part of the product name or user-facing identity.
+
+### ServiceTitan SMS request freshness
+
+For an expiring ServiceTitan SMS flow, prepare the profile-owned Google Voice page before requesting SMS. No-index `CMD+SHIFT+B` records a private baseline of visible ServiceTitan codes on that exact tab. Request SMS once, then use no-index `CMD+SHIFT+S` on the same tab. This capture accepts only a code absent from the baseline within 120 seconds; stale, missing, wrong-tab, expired, and replayed baselines fail closed. It returns only a dedicated baseline or capture acknowledgment, distinct from ordinary keyboard receipts. Consume the protected code immediately with indexed `CMD+V` into the exact ServiceTitan MFA field and submit once. Baseline hashes stay in process memory and clear with the protected transfer. The legacy `CMD+SHIFT+C` provider-correlated capture remains available for existing callers; it does not establish request freshness.

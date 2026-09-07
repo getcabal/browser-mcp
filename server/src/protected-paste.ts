@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmod, mkdir, unlink } from 'node:fs/promises';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
 import { dirname } from 'node:path';
@@ -28,6 +29,24 @@ export class ProtectedPasteState {
   private smsCode: Buffer | null = null;
   private smsProvider: ProtectedSmsProvider | null = null;
   private smsTimer: NodeJS.Timeout | null = null;
+  private smsBaseline: { tabId: number; at: number; hashes: Set<string> } | null = null;
+
+  armServiceTitanSms(tabId: number, codes: string[]): void {
+    this.clear();
+    this.smsBaseline = { tabId, at: Date.now(), hashes: new Set(codes.map(code => createHash('sha256').update(code).digest('hex'))) };
+  }
+
+  requireFreshServiceTitanSms(tabId: number, code: string): boolean {
+    const baseline = this.smsBaseline;
+    if (!baseline || baseline.tabId !== tabId || Date.now() - baseline.at > 120_000) {
+      this.clear();
+      throw new Error('Protected SMS capture requires a current matching request baseline');
+    }
+    if (baseline.hashes.has(createHash('sha256').update(code).digest('hex'))) {
+      return false;
+    }
+    return true;
+  }
 
   storeSmsCode(value: Buffer, provider: ProtectedSmsProvider = 'servicetitan'): void {
     this.clear();
@@ -64,7 +83,8 @@ export class ProtectedPasteState {
     return value;
   }
 
-  clear(): void {
+  clear(preserveBaseline = false): void {
+    if (!preserveBaseline) this.smsBaseline = null;
     this.clearCredential();
     if (this.smsTimer) clearTimeout(this.smsTimer);
     this.smsTimer = null;
@@ -223,7 +243,7 @@ export function protectedSmsProvider(
   args: Record<string, unknown>,
 ): ProtectedSmsProvider | null {
   const chord = normalizedChord(args);
-  if (['meta+shift+c', 'cmd+shift+c', 'command+shift+c'].includes(chord)) {
+  if (['meta', 'cmd', 'command'].some(key => ['c', 'b', 's'].some(letter => chord === `${key}+shift+${letter}`))) {
     return 'servicetitan';
   }
   if (['meta+shift+p', 'cmd+shift+p', 'command+shift+p'].includes(chord)) {
@@ -325,7 +345,7 @@ export function clearSystemClipboard(): Promise<void> {
   });
 }
 
-function protectedSmsCaptureExpression(provider: ProtectedSmsProvider): string {
+function protectedSmsCaptureExpression(provider: ProtectedSmsProvider, baseline = false): string {
   const providerLiteral = JSON.stringify(provider);
   return `(() => {
     if (location.hostname !== 'voice.google.com' || !location.pathname.startsWith('/u/0/messages')) {
@@ -335,7 +355,7 @@ function protectedSmsCaptureExpression(provider: ProtectedSmsProvider): string {
     // background. Exact tab binding plus host, path, and identity validation
     // are the security boundary; requiring foreground visibility makes the
     // normal protected-transfer workflow fail while the screen is locked.
-    const approvedIdentity = 'ocuser@qualitechmgmt.com';
+    const approvedIdentity = 'ocuser@example.com';
     const identityPresent = Array.from(document.querySelectorAll('[aria-label],[data-tooltip]')).some((element) => {
       const text = (element.getAttribute('aria-label') || '') + ' ' + (element.getAttribute('data-tooltip') || '');
       return text.includes(approvedIdentity);
@@ -365,6 +385,7 @@ function protectedSmsCaptureExpression(provider: ProtectedSmsProvider): string {
         if (match) candidates.push({ code: match[1] || match[2], x: rect.left, y: rect.top });
       }
     }
+    if (${baseline}) return { codes: [...new Set(candidates.map(candidate => candidate.code))] };
     if (candidates.length === 0) throw new Error('No correlated provider SMS code was visible');
     candidates.sort((a, b) => b.x - a.x || b.y - a.y);
     const best = candidates[0];
@@ -400,14 +421,22 @@ export async function captureProtectedServiceTitanSms(
   }
   const provider = protectedSmsProvider(args);
   if (!provider) throw new Error('Protected SMS capture requires an approved provider chord');
-  state.clear();
+  const chord = normalizedChord(args);
+  const baseline = chord.endsWith('+shift+b');
+  const fresh = chord.endsWith('+shift+s');
+  state.clear(fresh);
   const result = await bridge.callTool(
     'evaluate',
-    { tabId, expression: protectedSmsCaptureExpression(provider) },
+    { tabId, expression: protectedSmsCaptureExpression(provider, baseline) },
     PROTECTED_PASTE_TIMEOUT_MS,
   );
   try {
-    if (result.isError) throw new Error('Protected SMS capture was refused');
+    if (result.isError) {
+      if (fresh && textResult(result).includes('No correlated provider SMS code was visible')) {
+        return { content: [{ type: 'text', text: 'Waiting for a new provider SMS code' }] };
+      }
+      throw new Error('Protected SMS capture was refused');
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(textResult(result));
@@ -417,10 +446,21 @@ export async function captureProtectedServiceTitanSms(
     const record = typeof parsed === 'object' && parsed !== null
       ? parsed as Record<string, unknown>
       : null;
+    if (baseline) {
+      const codes = record && Object.keys(record).length === 1 ? record.codes : null;
+      if (!Array.isArray(codes) || codes.length > 2000 || !codes.every(code => typeof code === 'string' && /^\d{6}$/.test(code))) {
+        throw new Error('Protected SMS baseline returned an invalid result');
+      }
+      state.armServiceTitanSms(tabId, codes);
+      return { content: [{ type: 'text', text: 'ServiceTitan SMS baseline armed' }] };
+    }
     const code = record && Object.keys(record).length === 1 ? record.code : null;
     const expectedLength = provider === 'servicetitan' ? 6 : provider === 'paylocity' ? 5 : 8;
     if (typeof code !== 'string' || !new RegExp(`^[0-9]{${expectedLength}}$`).test(code)) {
       throw new Error('Protected SMS capture returned an invalid result');
+    }
+    if (fresh && !state.requireFreshServiceTitanSms(tabId, code)) {
+      return { content: [{ type: 'text', text: 'Waiting for a new provider SMS code' }] };
     }
     const bytes = Buffer.from(code, 'ascii');
     try {
@@ -429,7 +469,7 @@ export async function captureProtectedServiceTitanSms(
       bytes.fill(0);
     }
     return {
-      content: [{ type: 'text', text: `Pressed ${String(args.keys)}` }],
+      content: [{ type: 'text', text: fresh ? 'ServiceTitan fresh SMS captured' : `Pressed ${String(args.keys)}` }],
     };
   } finally {
     scrubTextResult(result);

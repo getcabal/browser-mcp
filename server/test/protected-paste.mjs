@@ -371,7 +371,7 @@ assert.equal(smsCaptureObserved.name, 'evaluate');
 assert.equal(smsCaptureObserved.args.tabId, 9);
 assert.match(smsCaptureObserved.args.expression, /voice\.google\.com/);
 assert.doesNotMatch(smsCaptureObserved.args.expression, /document\.visibilityState/);
-assert.match(smsCaptureObserved.args.expression, /ocuser@qualitechmgmt\.com/);
+assert.match(smsCaptureObserved.args.expression, /ocuser@example\.com/);
 assert.match(smsCaptureObserved.args.expression, /service\[\\s_-\]\*titan/);
 assert.match(smsCaptureObserved.args.expression, /querySelectorAll\('body \*'\)/);
 assert.match(smsCaptureObserved.args.expression, /b\.x - a\.x \|\| b\.y - a\.y/);
@@ -578,3 +578,67 @@ assert.equal(smsState.takeSmsCode(), null);
 smsState.clear();
 
 console.log('protected paste: exact credential paste and one-use provider SMS bridge ok');
+
+// Fresh-request ServiceTitan capture never reuses a code visible before send.
+const freshState = new ProtectedPasteState();
+const privateSmsResult = value => ({content:[{type:'text',text:JSON.stringify(value)}]});
+let smsFixture = { codes: ['123456'] };
+let lastPrivate;
+const freshBridge = {async callTool(name,args) {
+  assert.equal(name,'evaluate');
+  lastPrivate=privateSmsResult(smsFixture);
+  return lastPrivate;
+}};
+assert.equal(isProtectedSmsCaptureCall('press_key',{tabId:41,keys:'CMD+SHIFT+B'}),true);
+assert.equal(isProtectedSmsCaptureCall('press_key',{tabId:41,keys:'CMD+SHIFT+S'}),true);
+await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+B'},freshState);
+assert.equal(lastPrivate.content[0].text,'');
+smsFixture={code:'123456'};
+for(let i=0;i<2;i++) {
+  assert.equal((await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+S'},freshState)).content[0].text,'Waiting for a new provider SMS code');
+  assert.equal(lastPrivate.content[0].text,'');
+  assert.equal(freshState.takeSmsCode(),null);
+}
+smsFixture={code:'654321'};
+const freshReceipt=await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+S'},freshState);
+assert.equal(JSON.stringify(freshReceipt).includes('654321'),false);
+assert.equal(freshReceipt.content[0].text,'ServiceTitan fresh SMS captured');
+assert.equal(lastPrivate.content[0].text,'');
+let freshCode=freshState.takeSmsCode();assert.equal(freshCode.value.toString(),'654321');freshCode.value.fill(0);
+assert.equal(freshState.takeSmsCode(),null);
+await assert.rejects(captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+S'},freshState),/current matching request baseline/);
+for(const mode of ['wrong-tab','expired','cleared']) {
+  smsFixture={codes:[]};
+  await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+B'},freshState);
+  smsFixture={code:'654321'};
+  const originalNow=Date.now;
+  if(mode==='expired') {const now=Date.now();Date.now=()=>now+120001;}
+  if(mode==='cleared')freshState.clear();
+  try {await assert.rejects(captureProtectedServiceTitanSms(freshBridge,{tabId:mode==='wrong-tab'?42:41,keys:'CMD+SHIFT+S'},freshState),/current matching request baseline/);}
+  finally {Date.now=originalNow;}
+  assert.equal(freshState.takeSmsCode(),null);
+}
+for(const value of [{codes:['not-a-code']},{codes:['123456'],extra:true},{code:'123456'}]) {
+  smsFixture=value;
+  await assert.rejects(captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+B'},freshState),/baseline returned an invalid result/);
+  assert.equal(lastPrivate.content[0].text,'');
+}
+console.log('ServiceTitan fresh-request baseline: stale, missing, wrong-tab, expired and replayed codes rejected');
+
+// Exercise the generated baseline expression against a bounded DOM fixture.
+let baselineExpression;
+await captureProtectedServiceTitanSms({async callTool(name,args){baselineExpression=args.expression;return privateSmsResult({codes:[]});}}, {tabId:41,keys:'CMD+SHIFT+B'},new ProtectedPasteState());
+const fixtureContext=vm.createContext({});
+vm.runInContext(`
+const location={hostname:'voice.google.com',pathname:'/u/0/messages'};
+const getComputedStyle=()=>({display:'block',visibility:'visible'});
+const node=(text,x=1,y=1)=>({children:[],textContent:text,getAttribute:()=>'',getBoundingClientRect:()=>({width:10,height:10,left:x,top:y})});
+const identity={getAttribute:()=> 'ocuser@example.com'};
+let messages=[node('ServiceTitan code 123456'),node('ServiceTitan code 654321',2,2),node('Other code 987654')];
+const document={body:{innerText:''},querySelectorAll:s=>s==='body *'?messages:[identity]};
+`,fixtureContext);
+assert.equal(JSON.stringify(vm.runInContext(baselineExpression,fixtureContext)),JSON.stringify({codes:['123456','654321']}));
+vm.runInContext("messages=[node('Messages')]",fixtureContext);
+assert.equal(JSON.stringify(vm.runInContext(baselineExpression,fixtureContext)),JSON.stringify({codes:[]}));
+vm.runInContext("location.hostname='other.example'",fixtureContext);
+assert.throws(()=>vm.runInContext(baselineExpression,fixtureContext),/verified Google Voice/);
