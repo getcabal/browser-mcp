@@ -593,13 +593,13 @@ assert.equal(isProtectedSmsCaptureCall('press_key',{tabId:41,keys:'CMD+SHIFT+B'}
 assert.equal(isProtectedSmsCaptureCall('press_key',{tabId:41,keys:'CMD+SHIFT+S'}),true);
 await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+B'},freshState);
 assert.equal(lastPrivate.content[0].text,'');
-smsFixture={code:'123456'};
+smsFixture={codes:['123456']};
 for(let i=0;i<2;i++) {
   assert.equal((await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+S'},freshState)).content[0].text,'Waiting for a new provider SMS code');
   assert.equal(lastPrivate.content[0].text,'');
   assert.equal(freshState.takeSmsCode(),null);
 }
-smsFixture={code:'654321'};
+smsFixture={codes:['123456','654321']};
 const freshReceipt=await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+S'},freshState);
 assert.equal(JSON.stringify(freshReceipt).includes('654321'),false);
 assert.equal(freshReceipt.content[0].text,'ServiceTitan fresh SMS captured');
@@ -610,7 +610,7 @@ await assert.rejects(captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:
 for(const mode of ['wrong-tab','expired','cleared']) {
   smsFixture={codes:[]};
   await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+B'},freshState);
-  smsFixture={code:'654321'};
+  smsFixture={codes:['123456','654321']};
   const originalNow=Date.now;
   if(mode==='expired') {const now=Date.now();Date.now=()=>now+120001;}
   if(mode==='cleared')freshState.clear();
@@ -642,3 +642,18 @@ vm.runInContext("messages=[node('Messages')]",fixtureContext);
 assert.equal(JSON.stringify(vm.runInContext(baselineExpression,fixtureContext)),JSON.stringify({codes:[]}));
 vm.runInContext("location.hostname='other.example'",fixtureContext);
 assert.throws(()=>vm.runInContext(baselineExpression,fixtureContext),/verified Google Voice/);
+
+const ambiguityState=new ProtectedPasteState();
+smsFixture={codes:['123456']};
+await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+B'},ambiguityState);
+smsFixture={codes:['123456','654321','222222']};
+await assert.rejects(captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+S'},ambiguityState),/ambiguous new provider codes/);
+assert.equal(ambiguityState.takeSmsCode(),null);
+assert.equal(lastPrivate.content[0].text,'');
+smsFixture={codes:[]};
+assert.equal((await captureProtectedServiceTitanSms(freshBridge,{tabId:41,keys:'CMD+SHIFT+S'},ambiguityState)).content[0].text,'Waiting for a new provider SMS code');
+let freshExpression;
+await captureProtectedServiceTitanSms({async callTool(name,args){freshExpression=args.expression;return privateSmsResult({codes:['123456']});}}, {tabId:41,keys:'CMD+SHIFT+S'},ambiguityState);
+vm.runInContext("location.hostname='voice.google.com';messages=[node('ServiceTitan code 123456',100,100),node('ServiceTitan code 654321',1,1)]",fixtureContext);
+assert.equal(JSON.stringify(vm.runInContext(freshExpression,fixtureContext)),JSON.stringify({codes:['123456','654321']}));
+console.log('Fresh SMS selection includes inbox previews and refuses multiple new candidates');
