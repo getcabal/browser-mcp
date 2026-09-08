@@ -347,7 +347,7 @@ export function clearSystemClipboard(): Promise<void> {
 function protectedSmsCaptureExpression(provider: ProtectedSmsProvider, baseline = false): string {
   const providerLiteral = JSON.stringify(provider);
   return `(() => {
-    if (location.hostname !== 'voice.google.com' || !location.pathname.startsWith('/u/0/messages')) {
+    if (location.protocol !== 'https:' || location.hostname !== 'voice.google.com' || !/^\\/u\\/[0-9]+\\/messages\\/?$/.test(location.pathname)) {
       throw new Error('Protected SMS capture requires the verified Google Voice messages page');
     }
     // The MCP new-page primitive intentionally opens temporary pages in the
@@ -355,10 +355,12 @@ function protectedSmsCaptureExpression(provider: ProtectedSmsProvider, baseline 
     // are the security boundary; requiring foreground visibility makes the
     // normal protected-transfer workflow fail while the screen is locked.
     const approvedIdentity = 'ocuser@example.com';
-    const identityPresent = Array.from(document.querySelectorAll('[aria-label],[data-tooltip]')).some((element) => {
-      const text = (element.getAttribute('aria-label') || '') + ' ' + (element.getAttribute('data-tooltip') || '');
-      return text.includes(approvedIdentity);
-    }) || (document.body ? document.body.innerText.includes(approvedIdentity) : false);
+    const labels = Array.from(document.querySelectorAll('a[role=button][aria-label]'))
+      .filter(element => element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden')
+      .map(element => (element.getAttribute('aria-label') || '').trim())
+      .filter(label => /^Google Account\\s*:/i.test(label));
+    const identities = new Set(labels.flatMap(label => label.match(/[A-Z0-9.!#$%&'*+/=?^_\`{|}~-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi) || []).map(value => value.toLowerCase()));
+    const identityPresent = identities.size === 1 && identities.has(approvedIdentity);
     if (!identityPresent) throw new Error('Protected SMS capture found the wrong Google Voice identity');
     const elements = Array.from(document.querySelectorAll('body *'));
     if (elements.length === 0 || elements.length > 20000) {

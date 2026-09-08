@@ -630,10 +630,11 @@ let baselineExpression;
 await captureProtectedServiceTitanSms({async callTool(name,args){baselineExpression=args.expression;return privateSmsResult({codes:[]});}}, {tabId:41,keys:'CMD+SHIFT+B'},new ProtectedPasteState());
 const fixtureContext=vm.createContext({});
 vm.runInContext(`
-const location={hostname:'voice.google.com',pathname:'/u/0/messages'};
+const location={protocol:'https:',hostname:'voice.google.com',pathname:'/u/0/messages'};
 const getComputedStyle=()=>({display:'block',visibility:'visible'});
 const node=(text,x=1,y=1)=>({children:[],textContent:text,getAttribute:()=>'',getBoundingClientRect:()=>({width:10,height:10,left:x,top:y})});
-const identity={getAttribute:()=> 'ocuser@example.com'};
+let accountLabel='Google Account: Owner (ocuser@example.com)';
+const identity={getClientRects:()=>[{}],getAttribute:()=>accountLabel};
 let messages=[node('ServiceTitan code 123456'),node('ServiceTitan code 654321',2,2),node('Other code 987654')];
 const document={body:{innerText:''},querySelectorAll:s=>s==='body *'?messages:[identity]};
 `,fixtureContext);
@@ -657,3 +658,17 @@ await captureProtectedServiceTitanSms({async callTool(name,args){freshExpression
 vm.runInContext("location.hostname='voice.google.com';messages=[node('ServiceTitan code 123456',100,100),node('ServiceTitan code 654321',1,1)]",fixtureContext);
 assert.equal(JSON.stringify(vm.runInContext(freshExpression,fixtureContext)),JSON.stringify({codes:['123456','654321']}));
 console.log('Fresh SMS selection includes inbox previews and refuses multiple new candidates');
+
+for (const slot of [0,1,3]) {
+ vm.runInContext(`location.pathname='/u/${slot}/messages'`,fixtureContext);
+ assert.doesNotThrow(()=>vm.runInContext(baselineExpression,fixtureContext));
+}
+for (const label of ['other@example.com','Google Account: Owner (prefixocuser@example.com)','ocuser@example.com','Message Google Account: ocuser@example.com']) {
+ vm.runInContext(`accountLabel=${JSON.stringify(label)};document.body.innerText='ocuser@example.com'`,fixtureContext);
+ assert.throws(()=>vm.runInContext(baselineExpression,fixtureContext),/wrong Google Voice identity/);
+}
+vm.runInContext("accountLabel='Google Account: Owner (ocuser@example.com)';location.pathname='/u/1/messages-foreign'",fixtureContext);
+assert.throws(()=>vm.runInContext(baselineExpression,fixtureContext),/verified Google Voice/);
+vm.runInContext("location.pathname='/u/1/messages';location.protocol='http:'",fixtureContext);
+assert.throws(()=>vm.runInContext(baselineExpression,fixtureContext),/verified Google Voice/);
+console.log('Voice numeric account slots require exact active account metadata; body-only and prefix matches rejected');
