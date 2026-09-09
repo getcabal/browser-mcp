@@ -29,16 +29,16 @@ export class ProtectedPasteState {
   private smsCode: Buffer | null = null;
   private smsProvider: ProtectedSmsProvider | null = null;
   private smsTimer: NodeJS.Timeout | null = null;
-  private smsBaseline: { tabId: number; at: number; hashes: Set<string> } | null = null;
+  private smsBaseline: { tabId: number; provider: ProtectedSmsProvider; at: number; hashes: Set<string> } | null = null;
 
-  armServiceTitanSms(tabId: number, codes: string[]): void {
+  armServiceTitanSms(tabId: number, codes: string[], provider: ProtectedSmsProvider = 'servicetitan'): void {
     this.clear();
-    this.smsBaseline = { tabId, at: Date.now(), hashes: new Set(codes.map(code => createHash('sha256').update(code).digest('hex'))) };
+    this.smsBaseline = { tabId, provider, at: Date.now(), hashes: new Set(codes.map(code => createHash('sha256').update(code).digest('hex'))) };
   }
 
-  selectFreshServiceTitanSms(tabId: number, codes: string[]): string | null {
+  selectFreshServiceTitanSms(tabId: number, codes: string[], provider: ProtectedSmsProvider = 'servicetitan'): string | null {
     const baseline = this.smsBaseline;
-    if (!baseline || baseline.tabId !== tabId || Date.now() - baseline.at > 120_000) {
+    if (!baseline || baseline.tabId !== tabId || baseline.provider !== provider || Date.now() - baseline.at > 120_000) {
       this.clear();
       throw new Error('Protected SMS capture requires a current matching request baseline');
     }
@@ -245,10 +245,10 @@ export function protectedSmsProvider(
   if (['meta', 'cmd', 'command'].some(key => ['c', 'b', 's'].some(letter => chord === `${key}+shift+${letter}`))) {
     return 'servicetitan';
   }
-  if (['meta+shift+p', 'cmd+shift+p', 'command+shift+p'].includes(chord)) {
+  if (['meta', 'cmd', 'command'].some(key => ['shift+p', 'alt+p', 'shift+alt+p'].some(tail => chord === `${key}+${tail}`))) {
     return 'paylocity';
   }
-  if (['meta+shift+h', 'cmd+shift+h', 'command+shift+h'].includes(chord)) {
+  if (['meta', 'cmd', 'command'].some(key => ['shift+h', 'alt+h', 'shift+alt+h'].some(tail => chord === `${key}+${tail}`))) {
     return 'chase';
   }
   return null;
@@ -423,8 +423,10 @@ export async function captureProtectedServiceTitanSms(
   const provider = protectedSmsProvider(args);
   if (!provider) throw new Error('Protected SMS capture requires an approved provider chord');
   const chord = normalizedChord(args);
-  const baseline = chord.endsWith('+shift+b');
-  const fresh = chord.endsWith('+shift+s');
+  const baseline = chord.endsWith('+shift+b') || /^(meta|cmd|command)\+alt\+[ph]$/.test(chord);
+  const fresh = chord.endsWith('+shift+s') || /\+shift\+alt\+[ph]$/.test(chord);
+  const providerName = provider === 'servicetitan' ? 'ServiceTitan' : provider === 'paylocity' ? 'Paylocity' : 'Chase';
+  const expectedLength = provider === 'servicetitan' ? 6 : provider === 'paylocity' ? 5 : 8;
   state.clear(fresh);
   const result = await bridge.callTool(
     'evaluate',
@@ -449,22 +451,21 @@ export async function captureProtectedServiceTitanSms(
       : null;
     if (baseline) {
       const codes = record && Object.keys(record).length === 1 ? record.codes : null;
-      if (!Array.isArray(codes) || codes.length > 2000 || !codes.every(code => typeof code === 'string' && /^\d{6}$/.test(code))) {
+      if (!Array.isArray(codes) || codes.length > 2000 || !codes.every(code => typeof code === 'string' && new RegExp(`^[0-9]{${expectedLength}}$`).test(code))) {
         throw new Error('Protected SMS baseline returned an invalid result');
       }
-      state.armServiceTitanSms(tabId, codes);
-      return { content: [{ type: 'text', text: 'ServiceTitan SMS baseline armed' }] };
+      state.armServiceTitanSms(tabId, codes, provider);
+      return { content: [{ type: 'text', text: `${providerName} SMS baseline armed` }] };
     }
     let code = record && Object.keys(record).length === 1 ? record.code : null;
     if (fresh) {
       const codes = record && Object.keys(record).length === 1 ? record.codes : null;
-      if (!Array.isArray(codes) || codes.length > 2000 || !codes.every(value => typeof value === 'string' && /^\d{6}$/.test(value))) {
+      if (!Array.isArray(codes) || codes.length > 2000 || !codes.every(value => typeof value === 'string' && new RegExp(`^[0-9]{${expectedLength}}$`).test(value))) {
         throw new Error('Protected SMS capture returned an invalid result');
       }
-      code = state.selectFreshServiceTitanSms(tabId, codes);
+      code = state.selectFreshServiceTitanSms(tabId, codes, provider);
       if (code === null) return { content: [{ type: 'text', text: 'Waiting for a new provider SMS code' }] };
     }
-    const expectedLength = provider === 'servicetitan' ? 6 : provider === 'paylocity' ? 5 : 8;
     if (typeof code !== 'string' || !new RegExp(`^[0-9]{${expectedLength}}$`).test(code)) {
       throw new Error('Protected SMS capture returned an invalid result');
     }
@@ -475,7 +476,7 @@ export async function captureProtectedServiceTitanSms(
       bytes.fill(0);
     }
     return {
-      content: [{ type: 'text', text: fresh ? 'ServiceTitan fresh SMS captured' : `Pressed ${String(args.keys)}` }],
+      content: [{ type: 'text', text: fresh ? `${providerName} fresh SMS captured` : `Pressed ${String(args.keys)}` }],
     };
   } finally {
     scrubTextResult(result);

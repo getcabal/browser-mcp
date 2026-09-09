@@ -672,3 +672,25 @@ assert.throws(()=>vm.runInContext(baselineExpression,fixtureContext),/verified G
 vm.runInContext("location.pathname='/u/1/messages';location.protocol='http:'",fixtureContext);
 assert.throws(()=>vm.runInContext(baselineExpression,fixtureContext),/verified Google Voice/);
 console.log('Voice numeric account slots require exact active account metadata; body-only and prefix matches rejected');
+
+for (const [provider, key, title, oldCode, newCode] of [
+  ['paylocity','P','Paylocity','12345','54321'], ['chase','H','Chase','12345678','87654321']
+]) {
+  const state = new ProtectedPasteState();
+  let fixture = {codes:[oldCode]}; let privateResult;
+  const bridge = {async callTool(){privateResult=privateSmsResult(fixture);return privateResult;}};
+  const baseline={tabId:91,keys:`CMD+ALT+${key}`};const fresh={tabId:91,keys:`CMD+SHIFT+ALT+${key}`};
+  assert.equal(protectedSmsProvider(baseline),provider);assert.equal(protectedSmsProvider(fresh),provider);
+  assert.equal(isProtectedSmsCaptureCall('press_key',fresh),true);
+  assert.equal((await captureProtectedServiceTitanSms(bridge,baseline,state)).content[0].text,`${title} SMS baseline armed`);
+  assert.equal((await captureProtectedServiceTitanSms(bridge,fresh,state)).content[0].text,'Waiting for a new provider SMS code');
+  fixture={codes:[oldCode,newCode]};
+  const result=await captureProtectedServiceTitanSms(bridge,fresh,state);
+  assert.equal(result.content[0].text,`${title} fresh SMS captured`);
+  assert.equal(privateResult.content[0].text,'');assert.equal(JSON.stringify(result).includes(newCode),false);
+  const code=state.takeSmsCode();assert.equal(code.provider,provider);assert.equal(code.value.toString(),newCode);code.value.fill(0);
+  await assert.rejects(captureProtectedServiceTitanSms(bridge,fresh,state),/matching request baseline/);
+  state.armServiceTitanSms(91,[],provider==='chase'?'paylocity':'chase');
+  await assert.rejects(captureProtectedServiceTitanSms(bridge,fresh,state),/matching request baseline/);
+}
+console.log('Paylocity and Chase: old, replayed and cross-provider SMS codes rejected; private results scrubbed');
