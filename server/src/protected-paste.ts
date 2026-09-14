@@ -100,6 +100,8 @@ export class ProfileCredentialBroker {
     private readonly socketPath: string,
     private readonly state: ProtectedPasteState,
     private readonly privateNavigate?: (pageId: number) => Promise<string>,
+    private readonly privateQboPages?: () => Promise<string>,
+    private readonly privateQboPaste?: (pageId: number, field: 'username' | 'password') => Promise<string>,
   ) {}
 
   private handleConnection(client: Socket): void {
@@ -140,6 +142,22 @@ export class ProfileCredentialBroker {
       const request = Buffer.concat(chunks, total);
       clearChunks();
       try {
+        if (request.equals(Buffer.from('QBO-PAGES/1\n')) && this.privateQboPages) {
+          client.setTimeout(15_000);
+          let receipt = 'ERROR\n';
+          try { receipt = await this.privateQboPages(); } catch { /* private result never escapes */ }
+          finish(Buffer.from(receipt, 'utf8'));
+          return;
+        }
+        const qboPaste = request.subarray(0, 12).equals(Buffer.from('QBO-PASTE/1 '))
+          ? /^QBO-PASTE\/1 ([1-9][0-9]{0,15}) (username|password)\n$/.exec(request.toString('ascii')) : null;
+        if (qboPaste && this.privateQboPaste) {
+          client.setTimeout(20_000);
+          let receipt = 'ERROR\n';
+          try { receipt = await this.privateQboPaste(Number(qboPaste[1]), qboPaste[2] as 'username' | 'password'); } catch { /* no credential errors */ }
+          finish(Buffer.from(/^(?:PASTED|ERROR (?:staged|bridge|recipient|field|label|setter))\n$/.test(receipt) ? receipt : 'ERROR\n', 'ascii'));
+          return;
+        }
         const navigation = request.subarray(0, 15).equals(Buffer.from('QBO-NAVIGATE/1 '))
           ? /^QBO-NAVIGATE\/1 ([1-9][0-9]{0,15})\n$/.exec(request.toString('ascii')) : null;
         if (navigation && this.privateNavigate) {

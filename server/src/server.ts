@@ -5,6 +5,7 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { LocalExtensionBridge } from './bridge.js';
 import { VERSION, enrichTools } from './contract.js';
 import { navigatePrivateQboFile } from './private-navigation.js';
+import { privateQboPages, privateQboPaste } from './private-qbo-login.js';
 import {
   captureProtectedServiceTitanSms,
   deliverProtectedClipboardPaste,
@@ -44,7 +45,9 @@ export class LocalMcpServer {
       ?? (options.credentialSocket ? null : readSystemClipboard);
     this.credentialBroker = options.credentialSocket
       ? new ProfileCredentialBroker(options.credentialSocket, this.protectedPasteState,
-        (pageId) => navigatePrivateQboFile(this.bridge, options.profile ?? null, options.credentialSocket!, pageId))
+        (pageId) => navigatePrivateQboFile(this.bridge, options.profile ?? null, options.credentialSocket!, pageId),
+        () => privateQboPages(this.bridge, options.profile ?? null),
+        (pageId, field) => privateQboPaste(this.bridge, options.profile ?? null, this.protectedPasteState, pageId, field))
       : null;
     this.bridge = new LocalExtensionBridge({
       port: options.port,
