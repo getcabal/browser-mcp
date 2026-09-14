@@ -29,10 +29,12 @@ export function privateQboPasteExpression(fieldKind: 'username' | 'password', va
     const field = document.activeElement;
     if (!(field instanceof HTMLInputElement) || field.disabled || field.readOnly || field.value !== '' || field.getClientRects().length === 0) return {pasted:false,reason:"field"};
     const labelled = (field.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean).map(id => document.getElementById(id)?.textContent || '').join(' ');
-    const label = [...(field.labels || [])].map(el => el.textContent || '').join(' ') + ' ' + (field.getAttribute('aria-label') || '') + ' ' + labelled;
+    const label = [...(field.labels || [])].map(el => el.textContent || '').join(' ') + ' ' + (field.getAttribute('aria-label') || '') + ' ' + labelled + ' ' + (field.getAttribute('placeholder') || '') + ' ' + (field.parentElement?.getAttribute('aria-label') || '') + ' ' + (field.parentElement?.textContent || '');
     const kind = ${JSON.stringify(fieldKind)};
-    if (kind === 'username' && (!['text','email'].includes(field.type) || !/email|user\\s*id/i.test(label))) return {pasted:false,reason:"label"};
-    if (kind === 'password' && (field.type !== 'password' || !/password/i.test(label) || field.autocomplete === 'new-password')) return {pasted:false,reason:"label"};
+    if (kind === 'username' && !['text','email'].includes(field.type)) return {pasted:false,reason:"type"};
+    if (kind === 'username' && !/email|user\\s*id/i.test(label)) return {pasted:false,reason:"label"};
+    if (kind === 'password' && (field.type !== 'password' || field.autocomplete === 'new-password')) return {pasted:false,reason:"type"};
+    if (kind === 'password' && !/password/i.test(label)) return {pasted:false,reason:"label"};
     const value = ${JSON.stringify(value)};
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
     if (!setter) return {pasted:false,reason:"setter"};
@@ -61,7 +63,7 @@ export async function privateQboPaste(
     if (result.content.length !== 1 || result.content[0].type !== 'text') return 'ERROR\n';
     const receipt = JSON.parse(result.content[0].text as string);
     if (receipt && Object.keys(receipt).length === 1 && receipt.pasted === true) return 'PASTED\n';
-    return receipt?.pasted === false && ['recipient', 'field', 'label', 'setter'].includes(receipt.reason) ? `ERROR ${receipt.reason}\n` : 'ERROR\n';
+    return receipt?.pasted === false && ['recipient', 'field', 'type', 'label', 'setter'].includes(receipt.reason) ? `ERROR ${receipt.reason}\n` : 'ERROR\n';
   } catch { return 'ERROR\n'; }
   finally {
     bytes?.fill(0);

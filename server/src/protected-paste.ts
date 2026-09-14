@@ -155,7 +155,7 @@ export class ProfileCredentialBroker {
           client.setTimeout(20_000);
           let receipt = 'ERROR\n';
           try { receipt = await this.privateQboPaste(Number(qboPaste[1]), qboPaste[2] as 'username' | 'password'); } catch { /* no credential errors */ }
-          finish(Buffer.from(/^(?:PASTED|ERROR (?:staged|bridge|recipient|field|label|setter))\n$/.test(receipt) ? receipt : 'ERROR\n', 'ascii'));
+          finish(Buffer.from(/^(?:PASTED|ERROR (?:staged|bridge|recipient|field|type|label|setter))\n$/.test(receipt) ? receipt : 'ERROR\n', 'ascii'));
           return;
         }
         const navigation = request.subarray(0, 15).equals(Buffer.from('QBO-NAVIGATE/1 '))

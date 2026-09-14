@@ -27,6 +27,11 @@ for (const kind of ['username','password']) {
     assert.equal(result.pasted, expected);
     assert.equal(field.value === 'synthetic-secret', expected);
   }
+  for (const source of ['placeholder','parent']) {
+    const text = kind === 'password' ? 'Password' : 'Email or user ID';
+    const candidate = fixture(kind,{field:{labels:[], getAttribute:name => source === 'placeholder' && name === 'placeholder' ? text : '', parentElement:{getAttribute:()=>'',textContent:source === 'parent' ? text : ''}}});
+    assert.equal(vm.runInNewContext(privateQboPasteExpression(kind,'synthetic-secret'),candidate.context).pasted,true);
+  }
   const {field, context} = fixture(kind, {field:{labels:[], getAttribute:(name)=> name === 'aria-labelledby' ? 'login-label' : ''}});
   context.document.getElementById = id => id === 'login-label' ? {textContent:kind === 'password' ? 'Password' : 'Email or user ID'} : null;
   assert.equal(vm.runInNewContext(privateQboPasteExpression(kind,'synthetic-secret'),context).pasted,true);
