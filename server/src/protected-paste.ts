@@ -99,6 +99,7 @@ export class ProfileCredentialBroker {
   constructor(
     private readonly socketPath: string,
     private readonly state: ProtectedPasteState,
+    private readonly privateNavigate?: (pageId: number) => Promise<string>,
   ) {}
 
   private handleConnection(client: Socket): void {
@@ -134,11 +135,20 @@ export class ProfileCredentialBroker {
       }
       chunks.push(chunk);
     });
-    client.on('end', () => {
+    client.on('end', async () => {
       if (finished) return;
       const request = Buffer.concat(chunks, total);
       clearChunks();
       try {
+        const navigation = request.subarray(0, 15).equals(Buffer.from('QBO-NAVIGATE/1 '))
+          ? /^QBO-NAVIGATE\/1 ([1-9][0-9]{0,15})\n$/.exec(request.toString('ascii')) : null;
+        if (navigation && this.privateNavigate) {
+          client.setTimeout(35_000);
+          let receipt = 'ERROR\n';
+          try { receipt = await this.privateNavigate(Number(navigation[1])); } catch { /* never expose URL errors */ }
+          finish(Buffer.from(receipt === 'NAVIGATED\n' ? receipt : 'ERROR\n', 'ascii'));
+          return;
+        }
         if (request.equals(Buffer.from('CLEAR\n', 'ascii'))) {
           this.state.clearCredential();
           finish(Buffer.from('CLEARED\n', 'ascii'));
@@ -183,7 +193,7 @@ export class ProfileCredentialBroker {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    const server = createServer((client) => this.handleConnection(client));
+    const server = createServer({ allowHalfOpen: true }, (client) => this.handleConnection(client));
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => {

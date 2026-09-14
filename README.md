@@ -30,6 +30,28 @@ MCP client ── stdio ──> Node.js server ── ws://127.0.0.1:<port> ─�
 your request, so ordinary page navigation can naturally use the internet. The
 project itself makes no relay, account, analytics, update, or telemetry request.
 
+## Private Finance OAuth navigation
+
+The existing owner-only `credential.sock` accepts `QBO-NAVIGATE/1 <pageId>\n`.
+This is a deliberately narrow private transport, not a new public MCP tool.
+Only the `finance` bridge consumes its sibling
+`cache/qbo-oauth-state/authorization-url` file, after checking physical,
+owner-only directories and a bounded regular, single-link, owner-only file.
+Only Intuit Accounting OAuth with the approved HTTPS callback is accepted.
+The caller must first obtain an existing page ID from the profile's MCP tools.
+No arbitrary path or URL is accepted in the socket request. The URL file is
+unlinked before dispatch through the existing profile-bound extension bridge.
+Replies are only `NAVIGATED\n` or `ERROR\n`; navigation results and exception
+messages are never returned. `NAVIGATED` confirms dispatch success, not OAuth
+completion: inspect the resulting page and verify grants using the QBO connector.
+After an uncertain result, inspect current state rather than replaying a consumed
+file. The publisher must create a fresh OAuth flow for a new attempt.
+
+Build with `npm run build`. Reconnect only the Finance stdio connector to load
+server changes; preserve the visible browser, other profile connectors and the
+shared gateway. `node server/test/private-navigation.mjs` tests the file consumer
+and actual private-socket protocol with synthetic URLs, without launching a browser.
+
 ## Requirements
 
 - Node.js 18 or newer

@@ -4,6 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { LocalExtensionBridge } from './bridge.js';
 import { VERSION, enrichTools } from './contract.js';
+import { navigatePrivateQboFile } from './private-navigation.js';
 import {
   captureProtectedServiceTitanSms,
   deliverProtectedClipboardPaste,
@@ -42,7 +43,8 @@ export class LocalMcpServer {
     this.clipboardReader = options.clipboardReader
       ?? (options.credentialSocket ? null : readSystemClipboard);
     this.credentialBroker = options.credentialSocket
-      ? new ProfileCredentialBroker(options.credentialSocket, this.protectedPasteState)
+      ? new ProfileCredentialBroker(options.credentialSocket, this.protectedPasteState,
+        (pageId) => navigatePrivateQboFile(this.bridge, options.profile ?? null, options.credentialSocket!, pageId))
       : null;
     this.bridge = new LocalExtensionBridge({
       port: options.port,
