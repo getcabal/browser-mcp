@@ -115,10 +115,35 @@ for (const throws of [false, true]) {
       return refused;
     },
   }, { tabId: 7, keys: 'Meta+V', index: 999 }, async () => bytes),
-  /^Error: Protected clipboard indexed paste was refused$/);
+  { message: `Protected clipboard indexed paste was refused (${throws ? 'bridge_error' : 'unconfirmed_delivery'})` });
   assert.deepEqual(calls, ['fill']);
   assert.ok(bytes.every(byte => byte === 0));
   if (!throws) assert.equal(refused.content[0].text, '');
+}
+
+// Known pre-assignment failures expose a fixed category, never private text.
+for (const [privateError, category] of [
+  ['Error: Element @e42 is stale; call take_snapshot again', 'stale_target'],
+  ['Error: No snapshot for tab 7; call take_snapshot first', 'snapshot_required'],
+  ['Error: Unknown uid @e42 for tab 7; call take_snapshot again', 'snapshot_required'],
+  ['Error: Error: Protected paste target is not visible\n    at private-page INERT', 'target_not_visible'],
+  ['Error: Protected paste target is not editable', 'target_not_editable'],
+  ['Error: Error: Protected paste target could not be focused', 'target_not_focused'],
+  ['Error: Protected paste target is not editable private-suffix', 'unconfirmed_delivery'],
+  ['Error: Error: Protected paste did not populate the target', 'unconfirmed_delivery'],
+]) {
+  const state = new ProtectedPasteState();
+  const secret = Buffer.from('INERT-PRIVATE-CREDENTIAL');
+  state.storeCredential(secret);
+  const privateResult = { isError: true, content: [{ type: 'text', text: privateError }] };
+  let calls = 0;
+  await assert.rejects(deliverProtectedClipboardPaste({
+    async callTool(name) { assert.equal(name, 'fill'); calls++; return privateResult; },
+  }, { tabId: 7, index: 42, keys: 'CMD+V' }, null, state),
+  { message: `Protected clipboard indexed paste was refused (${category})` });
+  assert.equal(calls, 1);
+  assert.equal(state.takeCredential(), null);
+  assert.equal(privateResult.content[0].text, '');
 }
 
 const coordinateValue = 'local-test-coordinate-value';

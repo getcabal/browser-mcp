@@ -583,6 +583,28 @@ function requirePrivateFlag(
   }
 }
 
+// Report only fixed categories, never renderer errors, field contents or IDs.
+// These failures happen before assignment; the caller can repair the page and
+// acquire a fresh snapshot instead of treating a stale target as bad credentials.
+function indexedPasteFailure(result: ToolResult | undefined): string {
+  if (!result?.isError || result.content.length !== 1 || result.content[0].type !== 'text'
+    || typeof result.content[0].text !== 'string') {
+    return 'unconfirmed_delivery';
+  }
+  const firstLine = result.content[0].text.split('\n', 1)[0];
+  if (/^Error: Element @e[1-9]\d* is stale; call take_snapshot again$/.test(firstLine)) return 'stale_target';
+  if (/^Error: (?:No snapshot for tab [1-9]\d*; call take_snapshot first|Unknown uid @e[1-9]\d* for tab [1-9]\d*; call take_snapshot again)$/.test(firstLine)) return 'snapshot_required';
+  const fixed: Record<string, string> = {
+    'Error: Error: Protected paste target is not editable': 'target_not_editable',
+    'Error: Error: Protected paste target is not visible': 'target_not_visible',
+    'Error: Error: Protected paste target could not be focused': 'target_not_focused',
+    'Error: Protected paste target is not editable': 'target_not_editable',
+    'Error: Protected paste target is not visible': 'target_not_visible',
+    'Error: Protected paste target could not be focused': 'target_not_focused',
+  };
+  return fixed[firstLine] ?? 'unconfirmed_delivery';
+}
+
 function protectedPasteExpression(value: string, requireEmpty = true): string {
   const literal = JSON.stringify(value)
     .replace(/\u2028/g, '\\u2028')
@@ -778,15 +800,17 @@ export async function deliverProtectedClipboardPaste(
       // Resolve and focus/replace the exact node in one element-bound call.
       // The private fill result and secret never cross the MCP response boundary.
       let result: ToolResult | undefined;
+      let category = 'bridge_error';
       try {
         result = await bridge.callTool(
           'fill',
           { tabId, uid: indexedTarget, value, protectedEntry: true },
           PROTECTED_PASTE_TIMEOUT_MS,
         );
+        category = indexedPasteFailure(result);
         requirePrivateFlag(result, 'pasted', 'Protected clipboard paste was refused');
       } catch {
-        throw new Error('Protected clipboard indexed paste was refused');
+        throw new Error(`Protected clipboard indexed paste was refused (${category})`);
       } finally {
         if (result) scrubTextResult(result);
       }

@@ -86,7 +86,18 @@ assert.ok(contract.validateExtensionTools([...extension.TOOLS, {
 }]).includes('unexpected tool: set_remote'));
 
 const enrichedCore = contract.enrichTools(extension.TOOLS).slice(0, golden.length);
-assert.deepEqual(enrichedCore, golden, 'MCP enrichment returns the exact captured Vibe contract');
+const publicCore = structuredClone(enrichedCore);
+const publicPress = publicCore.find(tool => tool.name === 'press_key');
+for (const field of ['xRatio', 'yRatio']) {
+  const spec = publicPress.inputSchema.properties[field];
+  assert.equal(spec.type, 'number');
+  assert.equal(spec.exclusiveMinimum, 0);
+  assert.equal(spec.exclusiveMaximum, 1);
+  assert.match(spec.description, /Protected CMD\+V only/);
+  delete publicPress.inputSchema.properties[field];
+}
+assert.deepEqual(publicCore, golden, 'Only the two reviewed broker coordinate fields extend the public contract');
+assert.deepEqual(extension.CONTRACT_TOOLS, golden, 'Public enrichment must not mutate the extension wire contract');
 for (const tool of contract.ALL_TOOLS) {
   assert.equal(typeof tool.title, 'string', `${tool.name} has title`);
   for (const hint of ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint']) {

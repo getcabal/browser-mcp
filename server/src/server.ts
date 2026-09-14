@@ -68,6 +68,11 @@ export class LocalMcpServer {
       try {
         const args =
           (request.params.arguments as Record<string, unknown> | undefined) ?? {};
+        if (request.params.name === 'press_key'
+          && (args.xRatio !== undefined || args.yRatio !== undefined)
+          && !isProtectedPasteCall(request.params.name, args)) {
+          throw new Error('Credential coordinates require protected CMD+V');
+        }
         const result = isProtectedSmsCaptureCall(request.params.name, args)
           ? await captureProtectedServiceTitanSms(
             this.bridge,

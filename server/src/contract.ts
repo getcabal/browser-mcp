@@ -1104,13 +1104,29 @@ export function validateExtensionTools(advertised: ToolDefinition[]): string[] {
   return problems;
 }
 
-/** Merge title + annotations onto extension-provided definitions for tools/list. */
+/** Enrich the public MCP surface without changing the extension wire contract. */
 export function enrichTools(tools: ToolDefinition[]): Array<ToolDefinition & Partial<Pick<ContractTool, 'title' | 'annotations'>>> {
   return tools.map((toolDef) => {
     const known = BY_NAME.get(toolDef.name);
     if (!known) return toolDef;
     return {
       ...toolDef,
+      ...(toolDef.name === 'press_key' ? {
+        inputSchema: {
+          ...toolDef.inputSchema,
+          properties: {
+            ...(toolDef.inputSchema.properties as Record<string, unknown>),
+            xRatio: {
+              type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1,
+              description: 'Protected CMD+V only: exact visible field center from a fresh same-tab screenshot, divided by screenshot width. Requires yRatio, a one-use profile-broker credential, and no index. Never use for SMS or an ordinary keypress.',
+            },
+            yRatio: {
+              type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1,
+              description: 'Protected CMD+V only: exact visible field center from a fresh same-tab screenshot, divided by screenshot height. Requires xRatio, a one-use profile-broker credential, and no index. Never guess or reuse stale coordinates.',
+            },
+          },
+        },
+      } : {}),
       title: known.title,
       annotations: known.annotations,
     };

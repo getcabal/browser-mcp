@@ -45,9 +45,18 @@ try {
   await connecting;
   const listed = await client.listTools();
   assert.equal(listed.tools.length, 24);
-  assert.deepEqual(listed.tools.slice(0, 22), fixture.tools, 'stdio tools/list exactly matches live Vibe fixture');
+  const core = structuredClone(listed.tools.slice(0, 22));
+  const press = core.find(tool => tool.name === 'press_key');
+  for (const field of ['xRatio', 'yRatio']) {
+    assert.equal(press.inputSchema.properties[field].type, 'number');
+    delete press.inputSchema.properties[field];
+  }
+  assert.deepEqual(core, fixture.tools, 'stdio advertises Vibe plus the two protected coordinate fields');
+  const refused = await client.callTool({name: 'press_key', arguments: {tabId: 7, keys: 'Enter', xRatio: 0.4, yRatio: 0.5}});
+  assert.equal(refused.isError, true);
+  assert.equal(refused.content[0].text, 'Error: Credential coordinates require protected CMD+V');
   assert.deepEqual(listed.tools.slice(22).map((tool) => tool.name), ['get_text', 'evaluate']);
-  console.log('stdio MCP contract ok: start/--port compatibility and exact 22-tool tools/list');
+  console.log('stdio MCP contract ok: compatible 22 tools with protected coordinate recovery advertised');
 } finally {
   fake?.close();
   await client.close().catch(() => {});

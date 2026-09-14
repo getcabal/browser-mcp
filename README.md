@@ -221,13 +221,17 @@ annotated in tools/list):
 | `get_text` | — | `tabId` | Visible `innerText` of the page |
 | `evaluate` | `expression` | `tabId` | Evaluates a bare JS expression |
 
-The profile-local protected credential broker also accepts an internal
+The profile-local protected credential broker also advertises an optional
 renderer-opaque fallback on `press_key` with `keys="CMD+V"`: pass both
 `xRatio` and `yRatio` as finite viewport ratios strictly between 0 and 1,
 derived from the center of the exact field in a fresh Browser MCP screenshot.
 It is mutually exclusive with `index`, requires a one-use broker-staged
 credential, and keeps both the click and secret typing inside the browser
-bridge. It is not part of the advertised Vibe compatibility contract.
+bridge. The server adds these two optional fields to the public MCP schema;
+the extension's original Vibe wire contract remains unchanged. Coordinates on
+ordinary keypresses are rejected. Indexed failures return fixed, secret-free
+categories so a caller can repair the page, take a fresh snapshot and stage a
+new transfer instead of mistaking target failure for rejected credentials.
 
 ### The uid workflow
 
