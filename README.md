@@ -461,6 +461,10 @@ existing indexed `press_key` operation with `Home`, which changes only caret
 position. A coordinate click receipt is not evidence that the OTP field has
 focus. The broker still requires the exact provider field, same origin,
 visibility, editability, supported input type and an empty value before typing.
+Assignment repeats these guards atomically, uses the input's native value setter
+and dispatches input/change events privately. It does not depend on simulated
+typing into an active OS window. Only a verified private population receipt
+permits the subsequent verification submission.
 It may repeat only fixed transient readiness observations twice, 100ms apart;
 it never repeats focus, capture, SMS requests, typing or submission. Failures
 return fixed categories, and private tool results and consumed codes are

@@ -411,13 +411,13 @@ const smsPasteObserved = [];
 let clipboardReads = 0;
 const smsBeforeResult = { content: [{ type: 'text', text: '{"ready":true}' }] };
 const smsTypedResult = {
-  content: [{ type: 'text', text: `Typed ${JSON.stringify(dummyCode)}` }],
+  content: [{ type: 'text', text: '{"pasted":true}' }],
 };
 const smsAfterResult = { content: [{ type: 'text', text: '{"pasted":true}' }] };
 const smsPasteBridge = {
   async callTool(name, args, timeoutMs) {
     smsPasteObserved.push({ name, args, timeoutMs });
-    if (name === 'type_text') return smsTypedResult;
+    if (args.expression.includes('setter.call(field,')) return smsTypedResult;
     return smsPasteObserved.length === 1 ? smsBeforeResult : smsAfterResult;
   },
 };
@@ -433,7 +433,7 @@ const smsPasteResult = await deliverProtectedClipboardPaste(
 assert.equal(clipboardReads, 0);
 assert.deepEqual(smsPasteObserved.map((call) => call.name), [
   'evaluate',
-  'type_text',
+  'evaluate',
   'evaluate',
 ]);
 assert.equal(smsPasteObserved.every((call) => call.args.tabId === 11), true);
@@ -442,7 +442,8 @@ assert.match(smsPasteObserved[0].args.expression, /field\.name === 'sms-code'/);
 assert.match(smsPasteObserved[0].args.expression, /\['text', 'tel', 'number'\]/);
 assert.match(smsPasteObserved[0].args.expression, /field\.value !== ''/);
 assert.doesNotMatch(smsPasteObserved[0].args.expression, new RegExp(dummyCode));
-assert.equal(smsPasteObserved[1].args.text, dummyCode);
+assert.ok(smsPasteObserved[1].args.expression.includes(JSON.stringify(dummyCode)));
+assert.match(smsPasteObserved[1].args.expression, /field\.value !== ''/);
 assert.match(smsPasteObserved[2].args.expression, /\\d\{6\}/);
 assert.doesNotMatch(smsPasteObserved[2].args.expression, new RegExp(dummyCode));
 assert.equal(smsBeforeResult.content[0].text, '');
@@ -495,9 +496,7 @@ for (const providerCase of [
         const evaluateCount = providerPasteCalls.filter((call) => call.name === 'evaluate').length;
         const result = name === 'press_key'
           ? { content: [{ type: 'text', text: 'focused' }] }
-          : name === 'type_text'
-            ? { content: [{ type: 'text', text: 'typed' }] }
-            : { content: [{ type: 'text', text: evaluateCount === 1 ? '{"ready":true}' : '{"pasted":true}' }] };
+          : { content: [{ type: 'text', text: evaluateCount === 1 ? '{"ready":true}' : '{"pasted":true}' }] };
         privateResults.push(result);
         return result;
       },
@@ -511,24 +510,27 @@ for (const providerCase of [
   assert.deepEqual(providerPasteCalls.map((call) => call.name), [
     'press_key',
     'evaluate',
-    'type_text',
+    'evaluate',
     'evaluate',
   ]);
   assert.deepEqual(providerPasteCalls[0].args, { tabId: 22, keys: 'Home', index: 31 });
   assert.match(providerPasteCalls[1].args.expression, providerCase.targetPattern);
   assert.match(providerPasteCalls[3].args.expression, providerCase.expectedPattern);
-  assert.equal(providerPasteCalls[2].args.text, providerCase.code);
+  assert.ok(providerPasteCalls[2].args.expression.includes(JSON.stringify(providerCase.code)));
   if (providerCase.chord === 'Meta+Shift+P') {
     const context = vm.createContext({});
     vm.runInContext(`
-      class HTMLInputElement {}
+      class HTMLInputElement {
+        get value() { return this._value || ''; }
+        set value(value) { this._value = String(value); }
+      }
       const location = { origin: 'https://access.paylocity.com', hostname: 'access.paylocity.com', pathname: '/Mfa/Pin' };
-      const view = { location, HTMLInputElement, frameElement: null,
+      const view = { location, HTMLInputElement, Event: class Event {}, frameElement: null,
         getComputedStyle: () => ({display: 'block', visibility: 'visible'}) };
       const field = new HTMLInputElement();
       Object.assign(field, { ownerDocument: {defaultView: view}, id: 'OneTimePasscode', name: 'OneTimePasscode',
         labels: [{textContent: 'One-Time Passcode'}], type: 'text', value: '',
-        getAttribute: () => null, getBoundingClientRect: () => ({width: 200, height: 30}) });
+        getAttribute: () => null, dispatchEvent: () => {}, getBoundingClientRect: () => ({width: 200, height: 30}) });
       const document = {activeElement: field};
       globalThis.field = field;
       globalThis.location = location;
@@ -555,6 +557,16 @@ for (const providerCase of [
     assert.throws(() => vm.runInContext(before, context), /exact provider MFA field/);
     context.location.hostname = 'access.paylocity.com';
     assert.equal(vm.runInContext(before, context).ready, true);
+    const assignment = providerPasteCalls[2].args.expression;
+    for (const type of ['text', 'tel', 'number']) {
+      context.field.type = type;
+      assert.equal(vm.runInContext(assignment, context).pasted, true);
+      assert.equal(context.field.value, providerCase.code);
+      assert.throws(() => vm.runInContext(assignment, context), /wrong value state/);
+      assert.equal(context.field.value, providerCase.code);
+      context.field.value = '';
+    }
+    context.field.type = 'text';
 
     // Reproduce the actual failure: a coordinate click reports completion but
     // leaves focus outside the OTP field. Indexed focus must fix it before any
@@ -567,9 +579,6 @@ for (const providerCase of [
         if (name === 'press_key') {
           assert.deepEqual(args, {tabId: 22, keys: 'Home', index: 31});
           context.document.activeElement = context.field;
-        } else if (name === 'type_text') {
-          assert.equal(context.document.activeElement, context.field);
-          context.field.value = args.text;
         } else if (name === 'evaluate') {
           try {
             return {content: [{type: 'text', text: JSON.stringify(vm.runInContext(args.expression, context))}]};
@@ -662,14 +671,14 @@ for (const scenario of [
     async callTool(name, args) {
       calls.push(name);
       let result;
-      if (name === 'evaluate' && !typed) {
+      if (name === 'evaluate' && args.expression.includes('setter.call(field,')) {
+        typed = true;
+        result = {content: [{type: 'text', text: '{"pasted":true}'}]};
+      } else if (name === 'evaluate' && !typed) {
         guards += 1;
         result = scenario.settles && guards > 1
           ? {content: [{type: 'text', text: '{"ready":true}'}]}
           : {isError: true, content: [{type: 'text', text: 'Error: Error: ' + scenario.message}]};
-      } else if (name === 'type_text') {
-        typed = true;
-        result = {content: [{type: 'text', text: 'typed'}]};
       } else {
         result = {content: [{type: 'text', text: name === 'press_key' ? 'focused' : '{"pasted":true}'}]};
       }
@@ -683,14 +692,15 @@ for (const scenario of [
     const result = await action;
     assert.equal(JSON.stringify(result).includes('54321'), false);
     assert.equal(guards, 2);
-    assert.equal(calls.filter(name => name === 'type_text').length, 1);
+    assert.equal(typed, true);
   } else {
     await assert.rejects(action, error => error.message === `Protected SMS target was refused (${scenario.reason})`);
     assert.equal(guards, scenario.count);
-    assert.equal(calls.includes('type_text'), false);
+    assert.equal(typed, false);
   }
   assert.equal(calls.filter(name => name === 'press_key').length, 1);
   assert.equal(calls.includes('click'), false);
+  assert.equal(calls.includes('type_text'), false);
   assert.equal(results.every(result => result.content[0].text === ''), true);
   assert.equal(state.takeSmsCode(), null);
 }

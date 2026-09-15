@@ -514,8 +514,17 @@ export async function captureProtectedServiceTitanSms(
 function protectedSmsTargetExpression(
   provider: ProtectedSmsProvider,
   populated: boolean,
+  value?: string,
 ): string {
   const providerLiteral = JSON.stringify(provider);
+  const assignment = value === undefined ? '' : `
+    const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value')?.set;
+    if (typeof setter !== 'function') throw new Error('Protected SMS setter is unavailable');
+    setter.call(field, ${JSON.stringify(value)});
+    field.dispatchEvent(new view.Event('input', { bubbles: true }));
+    field.dispatchEvent(new view.Event('change', { bubbles: true }));
+    if (!expected.test(field.value)) throw new Error('Protected SMS typing did not populate the exact field');
+  `;
   return `(() => {
     let field = document.activeElement;
     while (field) {
@@ -559,7 +568,8 @@ function protectedSmsTargetExpression(
     if (${populated ? "!expected.test(field.value)" : "field.value !== ''"}) {
       throw new Error('Protected SMS target has the wrong value state');
     }
-    return { ${populated ? 'pasted' : 'ready'}: true };
+    ${assignment}
+    return { ${populated || value !== undefined ? 'pasted' : 'ready'}: true };
   })()`;
 }
 
@@ -778,12 +788,12 @@ export async function deliverProtectedClipboardPaste(
         }
 
         const typed = await bridge.callTool(
-          'type_text',
-          { tabId, text: value },
+          'evaluate',
+          { tabId, expression: protectedSmsTargetExpression(sms.provider, false, value) },
           PROTECTED_PASTE_TIMEOUT_MS,
         );
         privateResults.push(typed);
-        if (typed.isError) throw new Error('Protected SMS typing was refused');
+        requirePrivateFlag(typed, 'pasted', 'Protected SMS typing was refused');
 
         const after = await bridge.callTool(
           'evaluate',
