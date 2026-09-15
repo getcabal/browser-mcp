@@ -744,9 +744,13 @@ export async function deliverProtectedClipboardPaste(
       const privateResults: ToolResult[] = [];
       try {
         if (indexedTarget !== undefined) {
+          // Focus the exact snapshot node directly. A coordinate click can hit
+          // an overlay or a moving form while still returning a click receipt.
+          // Home changes only caret position; the empty-value guard below is
+          // retained and no character, code or submission is sent here.
           const focused = await bridge.callTool(
-            'click',
-            { tabId, uid: indexedTarget },
+            'press_key',
+            { tabId, keys: 'Home', index: indexedTarget },
             PROTECTED_PASTE_TIMEOUT_MS,
           );
           privateResults.push(focused);

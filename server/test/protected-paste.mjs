@@ -493,7 +493,7 @@ for (const providerCase of [
       async callTool(name, args, timeoutMs) {
         providerPasteCalls.push({ name, args, timeoutMs });
         const evaluateCount = providerPasteCalls.filter((call) => call.name === 'evaluate').length;
-        const result = name === 'click'
+        const result = name === 'press_key'
           ? { content: [{ type: 'text', text: 'focused' }] }
           : name === 'type_text'
             ? { content: [{ type: 'text', text: 'typed' }] }
@@ -509,12 +509,12 @@ for (const providerCase of [
     providerState,
   );
   assert.deepEqual(providerPasteCalls.map((call) => call.name), [
-    'click',
+    'press_key',
     'evaluate',
     'type_text',
     'evaluate',
   ]);
-  assert.deepEqual(providerPasteCalls[0].args, { tabId: 22, uid: 31 });
+  assert.deepEqual(providerPasteCalls[0].args, { tabId: 22, keys: 'Home', index: 31 });
   assert.match(providerPasteCalls[1].args.expression, providerCase.targetPattern);
   assert.match(providerPasteCalls[3].args.expression, providerCase.expectedPattern);
   assert.equal(providerPasteCalls[2].args.text, providerCase.code);
@@ -532,6 +532,8 @@ for (const providerCase of [
       const document = {activeElement: field};
       globalThis.field = field;
       globalThis.location = location;
+      globalThis.document = document;
+      globalThis.unfocusedBody = {ownerDocument: {defaultView: view}, tagName: 'BODY'};
     `, context);
     const before = providerPasteCalls[1].args.expression;
     const after = providerPasteCalls[3].args.expression;
@@ -553,6 +555,39 @@ for (const providerCase of [
     assert.throws(() => vm.runInContext(before, context), /exact provider MFA field/);
     context.location.hostname = 'access.paylocity.com';
     assert.equal(vm.runInContext(before, context).ready, true);
+
+    // Reproduce the actual failure: a coordinate click reports completion but
+    // leaves focus outside the OTP field. Indexed focus must fix it before any
+    // private code can be typed, rather than weakening the provider-field guard.
+    context.document.activeElement = context.unfocusedBody;
+    const focusState = new ProtectedPasteState();
+    focusState.storeSmsCode(Buffer.from(providerCase.code), 'paylocity');
+    const result = await deliverProtectedClipboardPaste({
+      async callTool(name, args) {
+        if (name === 'press_key') {
+          assert.deepEqual(args, {tabId: 22, keys: 'Home', index: 31});
+          context.document.activeElement = context.field;
+        } else if (name === 'type_text') {
+          assert.equal(context.document.activeElement, context.field);
+          context.field.value = args.text;
+        } else if (name === 'evaluate') {
+          try {
+            return {content: [{type: 'text', text: JSON.stringify(vm.runInContext(args.expression, context))}]};
+          } catch (error) {
+            return {isError: true, content: [{type: 'text', text: 'Error: ' + error.message}]};
+          }
+        } else {
+          assert.equal(name, 'click'); // Legacy click does not establish focus.
+        }
+        return {content: [{type: 'text', text: 'completed'}]};
+      },
+    }, {tabId: 22, keys: 'Meta+V', index: 31}, async () => {
+      throw new Error('must not use the system clipboard');
+    }, focusState);
+    assert.equal(context.field.value, providerCase.code);
+    assert.equal(JSON.stringify(result).includes(providerCase.code), false);
+    assert.equal(focusState.takeSmsCode(), null);
+    context.field.value = '';
   }
   if (providerCase.chord === 'Meta+Shift+H') {
     const frame = vm.createContext({});
@@ -636,7 +671,7 @@ for (const scenario of [
         typed = true;
         result = {content: [{type: 'text', text: 'typed'}]};
       } else {
-        result = {content: [{type: 'text', text: name === 'click' ? 'focused' : '{"pasted":true}'}]};
+        result = {content: [{type: 'text', text: name === 'press_key' ? 'focused' : '{"pasted":true}'}]};
       }
       results.push(result);
       return result;
@@ -654,7 +689,8 @@ for (const scenario of [
     assert.equal(guards, scenario.count);
     assert.equal(calls.includes('type_text'), false);
   }
-  assert.equal(calls.filter(name => name === 'click').length, 1);
+  assert.equal(calls.filter(name => name === 'press_key').length, 1);
+  assert.equal(calls.includes('click'), false);
   assert.equal(results.every(result => result.content[0].text === ''), true);
   assert.equal(state.takeSmsCode(), null);
 }
