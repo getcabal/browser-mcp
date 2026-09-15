@@ -518,6 +518,42 @@ for (const providerCase of [
   assert.match(providerPasteCalls[1].args.expression, providerCase.targetPattern);
   assert.match(providerPasteCalls[3].args.expression, providerCase.expectedPattern);
   assert.equal(providerPasteCalls[2].args.text, providerCase.code);
+  if (providerCase.chord === 'Meta+Shift+P') {
+    const context = vm.createContext({});
+    vm.runInContext(`
+      class HTMLInputElement {}
+      const location = { origin: 'https://access.paylocity.com', hostname: 'access.paylocity.com', pathname: '/Mfa/Pin' };
+      const view = { location, HTMLInputElement, frameElement: null,
+        getComputedStyle: () => ({display: 'block', visibility: 'visible'}) };
+      const field = new HTMLInputElement();
+      Object.assign(field, { ownerDocument: {defaultView: view}, id: 'OneTimePasscode', name: 'OneTimePasscode',
+        labels: [{textContent: 'One-Time Passcode'}], type: 'text', value: '',
+        getAttribute: () => null, getBoundingClientRect: () => ({width: 200, height: 30}) });
+      const document = {activeElement: field};
+      globalThis.field = field;
+      globalThis.location = location;
+    `, context);
+    const before = providerPasteCalls[1].args.expression;
+    const after = providerPasteCalls[3].args.expression;
+    assert.equal(vm.runInContext(before, context).ready, true);
+    context.field.value = providerCase.code;
+    assert.equal(vm.runInContext(after, context).pasted, true);
+    assert.throws(() => vm.runInContext(before, context), /wrong value state/);
+    context.field.value = '';
+    context.field.id = context.field.name = 'EmployeePIN';
+    assert.throws(() => vm.runInContext(before, context), /exact provider MFA field/);
+    context.field.id = context.field.name = 'OneTimePasscode';
+    context.field.readOnly = true;
+    assert.throws(() => vm.runInContext(before, context), /not editable/);
+    context.field.readOnly = false;
+    context.field.type = 'password';
+    assert.throws(() => vm.runInContext(before, context), /input type is unsupported/);
+    context.field.type = 'text';
+    context.location.hostname = 'paylocity.com.evil.example';
+    assert.throws(() => vm.runInContext(before, context), /exact provider MFA field/);
+    context.location.hostname = 'access.paylocity.com';
+    assert.equal(vm.runInContext(before, context).ready, true);
+  }
   if (providerCase.chord === 'Meta+Shift+H') {
     const frame = vm.createContext({});
     vm.runInContext(`
@@ -570,6 +606,57 @@ for (const providerCase of [
 
   assert.equal(privateResults.every((result) => result.content[0].text === ''), true);
   assert.equal(JSON.stringify(providerPasteResult).includes(providerCase.code), false);
+}
+
+// A provider may finish focus/rendering after its click receipt. Only fixed
+// transient guards get bounded read-only settling; no action or code is replayed.
+for (const scenario of [
+  { message: 'Protected SMS target is not the exact provider MFA field', settles: true },
+  { message: 'Protected SMS target is not visible', settles: true },
+  { message: 'Protected SMS target is not editable', settles: true },
+  { message: 'Protected SMS target is not visible', settles: false, count: 3, reason: 'target_not_visible' },
+  { message: 'Protected SMS target has the wrong value state', settles: false, count: 1, reason: 'target_not_empty' },
+  { message: 'Protected SMS target origin was refused', settles: false, count: 1, reason: 'target_origin' },
+  { message: 'renderer message with private data', settles: false, count: 1, reason: 'unconfirmed_target' },
+]) {
+  const state = new ProtectedPasteState();
+  state.storeSmsCode(Buffer.from('54321'), 'paylocity');
+  const calls = [], results = [];
+  let guards = 0, typed = false;
+  const action = deliverProtectedClipboardPaste({
+    async callTool(name, args) {
+      calls.push(name);
+      let result;
+      if (name === 'evaluate' && !typed) {
+        guards += 1;
+        result = scenario.settles && guards > 1
+          ? {content: [{type: 'text', text: '{"ready":true}'}]}
+          : {isError: true, content: [{type: 'text', text: 'Error: Error: ' + scenario.message}]};
+      } else if (name === 'type_text') {
+        typed = true;
+        result = {content: [{type: 'text', text: 'typed'}]};
+      } else {
+        result = {content: [{type: 'text', text: name === 'click' ? 'focused' : '{"pasted":true}'}]};
+      }
+      results.push(result);
+      return result;
+    },
+  }, {tabId: 22, keys: 'Meta+V', index: 31}, async () => {
+    throw new Error('must not use the system clipboard');
+  }, state);
+  if (scenario.settles) {
+    const result = await action;
+    assert.equal(JSON.stringify(result).includes('54321'), false);
+    assert.equal(guards, 2);
+    assert.equal(calls.filter(name => name === 'type_text').length, 1);
+  } else {
+    await assert.rejects(action, error => error.message === `Protected SMS target was refused (${scenario.reason})`);
+    assert.equal(guards, scenario.count);
+    assert.equal(calls.includes('type_text'), false);
+  }
+  assert.equal(calls.filter(name => name === 'click').length, 1);
+  assert.equal(results.every(result => result.content[0].text === ''), true);
+  assert.equal(state.takeSmsCode(), null);
 }
 
 const invalidCaptureResult = {

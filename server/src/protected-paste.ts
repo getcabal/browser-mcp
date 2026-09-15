@@ -583,6 +583,25 @@ function requirePrivateFlag(
   }
 }
 
+// Only fixed, broker-authored failures may leave the private SMS checks.
+// A click can finish before the provider's focus/render handlers settle.
+function smsTargetFailure(result: ToolResult): string {
+  if (!result.isError || result.content.length !== 1 || result.content[0].type !== 'text'
+    || typeof result.content[0].text !== 'string') {
+    return 'unconfirmed_target';
+  }
+  const line = result.content[0].text.split('\n', 1)[0].replace(/^(?:Error: ){1,2}/, '');
+  const known: Record<string, string> = {
+    'Protected SMS target origin was refused': 'target_origin',
+    'Protected SMS target is not the exact provider MFA field': 'target_not_focused',
+    'Protected SMS target is not editable': 'target_not_editable',
+    'Protected SMS target input type is unsupported': 'target_type',
+    'Protected SMS target is not visible': 'target_not_visible',
+    'Protected SMS target has the wrong value state': 'target_not_empty',
+  };
+  return known[line] ?? 'unconfirmed_target';
+}
+
 // Report only fixed categories, never renderer errors, field contents or IDs.
 // These failures happen before assignment; the caller can repair the page and
 // acquire a fresh snapshot instead of treating a stale target as bad credentials.
@@ -733,13 +752,26 @@ export async function deliverProtectedClipboardPaste(
           privateResults.push(focused);
           if (focused.isError) throw new Error('Protected SMS target could not be focused');
         }
-        const before = await bridge.callTool(
-          'evaluate',
-          { tabId, expression: protectedSmsTargetExpression(sms.provider, false) },
-          PROTECTED_PASTE_TIMEOUT_MS,
-        );
-        privateResults.push(before);
-        requirePrivateFlag(before, 'ready', 'Protected SMS target was refused');
+        for (let observation = 0; ; observation += 1) {
+          const before = await bridge.callTool(
+            'evaluate',
+            { tabId, expression: protectedSmsTargetExpression(sms.provider, false) },
+            PROTECTED_PASTE_TIMEOUT_MS,
+          );
+          privateResults.push(before);
+          try {
+            requirePrivateFlag(before, 'ready', 'Protected SMS target was refused');
+            break;
+          } catch {
+            const reason = smsTargetFailure(before);
+            if (observation >= 2 || !['target_not_focused', 'target_not_visible', 'target_not_editable'].includes(reason)) {
+              throw new Error(`Protected SMS target was refused (${reason})`);
+            }
+            // Read-only settling within this one-use delivery, never another
+            // click, capture, SMS request, typing attempt or verification submit.
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
 
         const typed = await bridge.callTool(
           'type_text',
