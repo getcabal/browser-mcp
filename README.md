@@ -449,6 +449,14 @@ npm run package   # Deterministic extension zips; --profile name:port stamps cop
 npm run clean     # Remove server/dist and dist
 ```
 
+## Tool failure diagnostics
+
+Failed tool calls emit a `browser_tool_failure` JSON record to server stderr.
+It includes the time, an allowlisted profile/tool name, and a fixed error category
+(for example `execution_context_lost` or `stale_element`). Raw error messages,
+arguments, page contents, URLs, identifiers and credentials are never logged.
+These diagnostics do not retry actions or change the tool response.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE). Legal attribution in the license is retained

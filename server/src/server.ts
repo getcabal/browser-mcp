@@ -4,6 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { LocalExtensionBridge } from './bridge.js';
 import { VERSION, enrichTools } from './contract.js';
+import { recordToolFailure } from './diagnostics.js';
 import { navigatePrivateQboFile } from './private-navigation.js';
 import { privateQboPages, privateQboPaste } from './private-qbo-login.js';
 import {
@@ -87,8 +88,14 @@ export class LocalMcpServer {
               this.protectedPasteState,
             )
             : await this.bridge.callTool(request.params.name, args);
+        if (result.isError) {
+          const errorText = result.content.filter(item => item.type === 'text')
+            .map(item => typeof item.text === 'string' ? item.text : '').join('\n');
+          recordToolFailure(options.profile, request.params.name, errorText);
+        }
         return result as unknown as CallToolResult;
       } catch (error) {
+        recordToolFailure(options.profile, request.params.name, error);
         return {
           content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
           isError: true,
