@@ -1124,6 +1124,10 @@ export function enrichTools(tools: ToolDefinition[]): Array<ToolDefinition & Par
               type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1,
               description: 'Protected CMD+V only: exact visible field center from a fresh same-tab screenshot, divided by screenshot height. Requires xRatio, a one-use profile-broker credential, and no index. Never guess or reuse stale coordinates.',
             },
+            targetTabId: {
+              type: 'number',
+              description: 'Protected SMS capture chords only: the exact tab ID of the provider MFA page that will receive the code. The captured code is then pasted only by protected CMD+V on that tab. Never use for an ordinary keypress.',
+            },
           },
         },
       } : {}),

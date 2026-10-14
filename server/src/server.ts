@@ -26,6 +26,7 @@ export interface ServerOptions {
   extensionConnectTimeoutMs?: number;
   clipboardReader?: ClipboardReader;
   credentialSocket?: string | null;
+  requireTabBoundSecrets?: boolean;
 }
 
 export class LocalMcpServer {
@@ -48,7 +49,8 @@ export class LocalMcpServer {
       ? new ProfileCredentialBroker(options.credentialSocket, this.protectedPasteState,
         (pageId) => navigatePrivateQboFile(this.bridge, options.profile ?? null, options.credentialSocket!, pageId),
         () => privateQboPages(this.bridge, options.profile ?? null),
-        (pageId, field) => privateQboPaste(this.bridge, options.profile ?? null, this.protectedPasteState, pageId, field))
+        (pageId, field) => privateQboPaste(this.bridge, options.profile ?? null, this.protectedPasteState, pageId, field),
+        { requireTabBound: options.requireTabBoundSecrets ?? false })
       : null;
     this.bridge = new LocalExtensionBridge({
       port: options.port,
@@ -73,6 +75,10 @@ export class LocalMcpServer {
           && (args.xRatio !== undefined || args.yRatio !== undefined)
           && !isProtectedPasteCall(request.params.name, args)) {
           throw new Error('Credential coordinates require protected CMD+V');
+        }
+        if (request.params.name === 'press_key' && args.targetTabId !== undefined
+          && !isProtectedSmsCaptureCall(request.params.name, args)) {
+          throw new Error('targetTabId requires a protected SMS capture chord');
         }
         const result = isProtectedSmsCaptureCall(request.params.name, args)
           ? await captureProtectedServiceTitanSms(
@@ -167,7 +173,7 @@ export class LocalMcpServer {
       this.graceTimer = null;
     }
     this.connected = false;
-    this.protectedPasteState.clear();
+    this.protectedPasteState.clearAll();
     await this.credentialBroker?.stop();
     try { await this.mcp.close(); } catch { /* transport already gone */ }
     await this.bridge.stop();

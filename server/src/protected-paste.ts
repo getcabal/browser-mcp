@@ -9,9 +9,16 @@ const CLIPBOARD_MAX_BYTES = 65_536;
 const CLIPBOARD_TIMEOUT_MS = 5_000;
 const PROTECTED_PASTE_TIMEOUT_MS = 15_000;
 const PROTECTED_SMS_TTL_MS = 180_000;
-const CREDENTIAL_PROTOCOL = Buffer.from('HERMES-CREDENTIAL/1', 'ascii');
+// Several agents can share one profile browser. A credential staged for an
+// exact tab waits only for that tab's protected CMD+V, and only briefly.
+const TAB_CREDENTIAL_TTL_MS = 120_000;
+const MAX_TAB_CREDENTIALS = 32;
 
 export type ProtectedSmsProvider = 'servicetitan' | 'paylocity' | 'chase';
+
+function isExactTabId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
 
 export type ClipboardReader = () => Promise<Buffer>;
 export type ClipboardClearer = () => Promise<void>;
@@ -25,11 +32,16 @@ export interface ProtectedPasteBridge {
 }
 
 export class ProtectedPasteState {
+  // Untagged legacy slot (v1 frames): any tab's protected CMD+V may take it.
   private credential: Buffer | null = null;
+  private readonly tabCredentials = new Map<number, { value: Buffer; timer: NodeJS.Timeout }>();
   private smsCode: Buffer | null = null;
   private smsProvider: ProtectedSmsProvider | null = null;
+  private smsTabId: number | null = null;
   private smsTimer: NodeJS.Timeout | null = null;
   private smsBaseline: { tabId: number; provider: ProtectedSmsProvider; at: number; hashes: Set<string> } | null = null;
+
+  constructor(private readonly tabCredentialTtlMs = TAB_CREDENTIAL_TTL_MS) {}
 
   armServiceTitanSms(tabId: number, codes: string[], provider: ProtectedSmsProvider = 'servicetitan'): void {
     this.clear();
@@ -47,41 +59,76 @@ export class ProtectedPasteState {
     return fresh[0] ?? null;
   }
 
-  storeSmsCode(value: Buffer, provider: ProtectedSmsProvider = 'servicetitan'): void {
+  /** A code bound to a tab is released only to that tab's protected CMD+V. */
+  storeSmsCode(value: Buffer, provider: ProtectedSmsProvider = 'servicetitan', tabId: number | null = null): void {
     this.clear();
     this.smsCode = Buffer.from(value);
     this.smsProvider = provider;
+    this.smsTabId = tabId;
     this.smsTimer = setTimeout(() => this.clear(), PROTECTED_SMS_TTL_MS);
     this.smsTimer.unref();
   }
 
-  storeCredential(value: Buffer): void {
-    this.clearCredential();
-    this.credential = Buffer.from(value);
+  /** Without a tab ID this fills the untagged legacy slot. */
+  storeCredential(value: Buffer, tabId?: number): void {
+    if (tabId === undefined) {
+      this.clearCredential();
+      this.credential = Buffer.from(value);
+      return;
+    }
+    if (!isExactTabId(tabId)) throw new Error('Protected credential staging requires an exact tab ID');
+    this.clearCredential(tabId);
+    if (this.tabCredentials.size >= MAX_TAB_CREDENTIALS) {
+      throw new Error('Too many protected credentials are staged');
+    }
+    const timer = setTimeout(() => this.clearCredential(tabId), this.tabCredentialTtlMs);
+    timer.unref();
+    this.tabCredentials.set(tabId, { value: Buffer.from(value), timer });
   }
 
-  takeCredential(): Buffer | null {
+  /** The tab's own staged value first, then the untagged legacy slot. */
+  takeCredential(tabId?: number): Buffer | null {
+    if (tabId !== undefined) {
+      const entry = this.tabCredentials.get(tabId);
+      if (entry) {
+        clearTimeout(entry.timer);
+        this.tabCredentials.delete(tabId);
+        return entry.value;
+      }
+    }
     if (!this.credential) return null;
     const value = this.credential;
     this.credential = null;
     return value;
   }
 
-  clearCredential(): void {
-    if (this.credential) this.credential.fill(0);
-    this.credential = null;
+  /** Without a tab ID this clears only the untagged legacy slot. */
+  clearCredential(tabId?: number): void {
+    if (tabId === undefined) {
+      if (this.credential) this.credential.fill(0);
+      this.credential = null;
+      return;
+    }
+    const entry = this.tabCredentials.get(tabId);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    entry.value.fill(0);
+    this.tabCredentials.delete(tabId);
   }
 
-  takeSmsCode(): { value: Buffer; provider: ProtectedSmsProvider } | null {
+  takeSmsCode(tabId?: number): { value: Buffer; provider: ProtectedSmsProvider } | null {
     if (!this.smsCode || !this.smsProvider) return null;
+    if (this.smsTabId !== null && this.smsTabId !== tabId) return null;
     const value = { value: this.smsCode, provider: this.smsProvider };
     this.smsCode = null;
     this.smsProvider = null;
+    this.smsTabId = null;
     if (this.smsTimer) clearTimeout(this.smsTimer);
     this.smsTimer = null;
     return value;
   }
 
+  /** SMS state and the legacy slot; tab-bound credentials belong to their tabs. */
   clear(preserveBaseline = false): void {
     if (!preserveBaseline) this.smsBaseline = null;
     this.clearCredential();
@@ -90,6 +137,12 @@ export class ProtectedPasteState {
     if (this.smsCode) this.smsCode.fill(0);
     this.smsCode = null;
     this.smsProvider = null;
+    this.smsTabId = null;
+  }
+
+  clearAll(): void {
+    this.clear();
+    for (const tabId of [...this.tabCredentials.keys()]) this.clearCredential(tabId);
   }
 }
 
@@ -102,6 +155,9 @@ export class ProfileCredentialBroker {
     private readonly privateNavigate?: (pageId: number) => Promise<string>,
     private readonly privateQboPages?: () => Promise<string>,
     private readonly privateQboPaste?: (pageId: number, field: 'username' | 'password') => Promise<string>,
+    // Strict mode refuses untagged v1 frames, so every staged value is bound
+    // to the exact tab whose protected CMD+V will consume it.
+    private readonly options: { requireTabBound?: boolean } = {},
   ) {}
 
   private handleConnection(client: Socket): void {
@@ -172,29 +228,49 @@ export class ProfileCredentialBroker {
           finish(Buffer.from('CLEARED\n', 'ascii'));
           return;
         }
+        const clearTab = request.length <= 32
+          ? /^CLEAR\/2 ([1-9][0-9]{0,15})\n$/.exec(request.toString('latin1')) : null;
+        if (clearTab) {
+          const tabId = Number(clearTab[1]);
+          if (!isExactTabId(tabId)) {
+            finish(Buffer.from('ERROR\n', 'ascii'));
+            return;
+          }
+          this.state.clearCredential(tabId);
+          finish(Buffer.from('CLEARED\n', 'ascii'));
+          return;
+        }
         const separator = request.indexOf(0x0a);
-        if (separator <= 0) {
+        if (separator <= 0 || separator > 64) {
           finish(Buffer.from('ERROR\n', 'ascii'));
           return;
         }
-        const header = request.subarray(0, separator);
-        const space = header.lastIndexOf(0x20);
-        if (space <= 0 || !header.subarray(0, space).equals(CREDENTIAL_PROTOCOL)) {
+        // HERMES-CREDENTIAL/2 <tabId> <length> binds the value to one tab;
+        // HERMES-CREDENTIAL/1 <length> fills the untagged legacy slot.
+        const header = request.subarray(0, separator).toString('latin1');
+        const tagged = /^HERMES-CREDENTIAL\/2 ([1-9][0-9]{0,15}) ([1-9][0-9]{0,4})$/.exec(header);
+        const untagged = tagged ? null : /^HERMES-CREDENTIAL\/1 ([1-9][0-9]{0,4})$/.exec(header);
+        if ((!tagged && !untagged) || (untagged && this.options.requireTabBound)) {
           finish(Buffer.from('ERROR\n', 'ascii'));
           return;
         }
-        const lengthText = header.subarray(space + 1).toString('ascii');
-        if (!/^[1-9][0-9]{0,4}$/.test(lengthText)) {
+        const tabId = tagged ? Number(tagged[1]) : undefined;
+        if (tagged && !isExactTabId(tabId)) {
           finish(Buffer.from('ERROR\n', 'ascii'));
           return;
         }
-        const declaredLength = Number(lengthText);
+        const declaredLength = Number(tagged ? tagged[2] : untagged![1]);
         const value = request.subarray(separator + 1);
         if (declaredLength !== value.length || declaredLength > CLIPBOARD_MAX_BYTES) {
           finish(Buffer.from('ERROR\n', 'ascii'));
           return;
         }
-        this.state.storeCredential(value);
+        try {
+          this.state.storeCredential(value, tabId);
+        } catch {
+          finish(Buffer.from('ERROR\n', 'ascii'));
+          return;
+        }
         finish(Buffer.from('STAGED\n', 'ascii'));
       } finally {
         request.fill(0);
@@ -453,6 +529,12 @@ export async function captureProtectedServiceTitanSms(
   const chord = normalizedChord(args);
   const baseline = chord.endsWith('+shift+b') || /^(meta|cmd|command)\+alt\+[ph]$/.test(chord);
   const fresh = chord.endsWith('+shift+s') || /\+shift\+alt\+[ph]$/.test(chord);
+  // The provider MFA page's tab. A bound code is pasted only on that tab, so
+  // another agent sharing this browser can neither receive nor consume it.
+  const targetTabId = args.targetTabId;
+  if (targetTabId !== undefined && (baseline || !isExactTabId(targetTabId))) {
+    throw new Error('Protected SMS targetTabId must be the exact tab ID of the provider page for a capture chord');
+  }
   const providerName = provider === 'servicetitan' ? 'ServiceTitan' : provider === 'paylocity' ? 'Paylocity' : 'Chase';
   const expectedLength = provider === 'servicetitan' ? 6 : provider === 'paylocity' ? 5 : 8;
   state.clear(fresh);
@@ -499,7 +581,7 @@ export async function captureProtectedServiceTitanSms(
     }
     const bytes = Buffer.from(code, 'ascii');
     try {
-      state.storeSmsCode(bytes, provider);
+      state.storeSmsCode(bytes, provider, targetTabId === undefined ? null : targetTabId as number);
     } finally {
       bytes.fill(0);
     }
@@ -723,8 +805,8 @@ export async function deliverProtectedClipboardPaste(
     throw new Error('Protected clipboard paste requires a positive snapshot index');
   }
   const coordinateTarget = protectedPastePoint(args, indexedTarget);
-  const sms = state?.takeSmsCode() ?? null;
-  const stagedCredential = sms === null ? state?.takeCredential() ?? null : null;
+  const sms = state?.takeSmsCode(tabId) ?? null;
+  const stagedCredential = sms === null ? state?.takeCredential(tabId) ?? null : null;
   // Coordinates are an explicit fallback for renderer-opaque credential
   // fields. Require the profile-local, one-use credential broker for this
   // path; never source a coordinate-directed secret from ambient clipboard.

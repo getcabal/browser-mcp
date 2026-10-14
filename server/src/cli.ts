@@ -17,6 +17,10 @@ Options:
                                     (default 90000)
   --debug                           Verbose bridge logging on stderr
   --help                            Show this help
+
+Environment:
+  BROWSER_MCP_STATE_DIR                  Directory for the profile credential socket
+  BROWSER_MCP_REQUIRE_TAB_BOUND_SECRETS  Set to 1 to accept only tab-bound staged secrets
 `;
 
 function fail(message: string): never {
@@ -87,6 +91,7 @@ const stateDir = (process.env.BROWSER_MCP_STATE_DIR ?? '').trim();
 const credentialSocket = profile && stateDir
   ? resolve(stateDir, 'credential.sock')
   : null;
+const requireTabBoundSecrets = (process.env.BROWSER_MCP_REQUIRE_TAB_BOUND_SECRETS ?? '').trim() === '1';
 const server = new LocalMcpServer({
   port,
   debug,
@@ -94,6 +99,7 @@ const server = new LocalMcpServer({
   requireExtension,
   extensionConnectTimeoutMs,
   credentialSocket,
+  requireTabBoundSecrets,
 });
 let shuttingDown = false;
 const shutdown = (exitCode: number): void => {

@@ -96,7 +96,11 @@ for (const field of ['xRatio', 'yRatio']) {
   assert.match(spec.description, /Protected CMD\+V only/);
   delete publicPress.inputSchema.properties[field];
 }
-assert.deepEqual(publicCore, golden, 'Only the two reviewed broker coordinate fields extend the public contract');
+const targetTab = publicPress.inputSchema.properties.targetTabId;
+assert.equal(targetTab.type, 'number');
+assert.match(targetTab.description, /Protected SMS capture chords only/);
+delete publicPress.inputSchema.properties.targetTabId;
+assert.deepEqual(publicCore, golden, 'Only the reviewed broker coordinate and SMS target fields extend the public contract');
 assert.deepEqual(extension.CONTRACT_TOOLS, golden, 'Public enrichment must not mutate the extension wire contract');
 for (const tool of contract.ALL_TOOLS) {
   assert.equal(typeof tool.title, 'string', `${tool.name} has title`);

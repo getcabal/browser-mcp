@@ -233,6 +233,18 @@ ordinary keypresses are rejected. Indexed failures return fixed, secret-free
 categories so a caller can repair the page, take a fresh snapshot and stage a
 new transfer instead of mistaking target failure for rejected credentials.
 
+Several agents can share one profile browser, so a staged secret can be bound
+to the exact tab that will receive it. `HERMES-CREDENTIAL/2 <tabId> <length>\n`
+followed by the value stages a one-use secret for that tab only, for at most
+120 seconds; `CLEAR/2 <tabId>\n` clears it. A protected `CMD+V` takes its own
+tab's value, then falls back to the untagged slot that the original
+`HERMES-CREDENTIAL/1 <length>\n` frame fills, so a paste on one tab can never
+receive or consume a secret staged for another. `CLEAR\n` clears only the
+untagged slot, and SMS steps no longer clear tab-bound values. With
+`BROWSER_MCP_REQUIRE_TAB_BOUND_SECRETS=1` the broker refuses untagged frames.
+SMS capture chords accept a server-only `targetTabId`: the captured code is
+then pasted only on that provider page's tab.
+
 ### The uid workflow
 
 Call `take_snapshot` before interacting with elements. It returns compact

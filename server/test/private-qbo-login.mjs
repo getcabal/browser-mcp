@@ -54,6 +54,13 @@ assert.equal(await privateQboPaste(bridge,'finance',state,7,'username'),'ERROR s
 state.storeCredential(Buffer.from('synthetic-secret'));
 assert.equal(await privateQboPaste(bridge,'marketing',state,7,'username'),'ERROR\n');
 assert.equal(state.takeCredential(),null);
+// A value staged for page 7 is used there; one staged for another page is not.
+state.storeCredential(Buffer.from('synthetic-secret'), 7);
+state.storeCredential(Buffer.from('other-page-secret'), 8);
+assert.equal(await privateQboPaste(bridge,'finance',state,7,'username'),'PASTED\n');
+assert.equal(state.takeCredential(7),null);
+assert.equal(await privateQboPaste(bridge,'finance',state,7,'username'),'ERROR staged\n');
+assert.equal(String(state.takeCredential(8)),'other-page-secret');
 for (const response of [{isError:true,content:[{type:'text',text:'synthetic-secret'}]}, {content:[{type:'text',text:'{"pasted":true,"value":"synthetic-secret"}'}]}, {content:[{type:'text',text:'{"pasted":false}'}]}]) {
   state.storeCredential(Buffer.from('synthetic-secret'));
   assert.equal(await privateQboPaste({callTool:async()=>response},'finance',state,7,'username'), response.isError ? 'ERROR bridge\n' : 'ERROR\n');

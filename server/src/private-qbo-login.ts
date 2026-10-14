@@ -53,7 +53,7 @@ export async function privateQboPaste(
   let result;
   try {
     if (profile !== 'finance' || !Number.isSafeInteger(pageId) || pageId <= 0 || !['username', 'password'].includes(fieldKind)) return 'ERROR\n';
-    bytes = state.takeCredential();
+    bytes = state.takeCredential(pageId);
     if (!bytes?.length) return 'ERROR staged\n';
     const value = new TextDecoder('utf-8', {fatal:true}).decode(bytes);
     result = await bridge.callTool('evaluate', {
@@ -67,6 +67,7 @@ export async function privateQboPaste(
   } catch { return 'ERROR\n'; }
   finally {
     bytes?.fill(0);
+    state.clearCredential(pageId);
     state.clearCredential();
     if (result) for (const block of result.content) if (block.type === 'text') block.text = '';
   }
