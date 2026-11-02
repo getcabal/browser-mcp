@@ -283,6 +283,20 @@ frames that extend the server-side call timer.
 - Stale accessibility references are relocated once by role and accessible name.
 - Reconnection backs off from one to thirty seconds; a `chrome.alarms` kicker
   survives service-worker suspension.
+- Chrome refuses the debugger on a tab that holds another extension's frame.
+  When a 1Password panel (a passkey offer, save-login prompt or suggestion
+  list) blocks a tab, the extension removes that panel from the page and
+  retries, at most three times in about 1.5 s, and the next `take_snapshot`
+  of the tab says so once. It changes no setting and never reads the panel's
+  frame. It leaves the panel open on Google's passkey and security-key
+  challenge pages, where the prompt is the sign-in step itself, and never
+  removes another extension's frame; there, and when the panel keeps coming
+  back, the tool fails with Chrome's `Cannot access a chrome-extension:// URL
+  of different extension` text plus what to do next (finish or close the panel
+  outside the page tools, then take a new snapshot).
+- When a call asks for page state (`pageStateFormat`) and only that snapshot
+  fails, the call keeps its own result and adds `Page state … is unavailable:`
+  with the reason, instead of failing an action that already happened.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full call lifecycle and
 handshake state machine.
@@ -373,6 +387,9 @@ packaged name/port metadata. Modified or stale installs fail closed.
 - The extension requires powerful `debugger`, `tabs`, and `<all_urls>` access to
   control arbitrary tabs. Review the small, unbundled `extension/background.js`
   before installing it.
+- The `scripting` permission is used only to remove a blocking 1Password panel
+  from a page, as described under Reliability. The injected function reads the
+  page's own elements, never the other extension's frame or storage.
 - `evaluate_script`, `wait_for_condition`, and `evaluate` run caller-supplied
   JavaScript in the selected page. Remove their entries from
   `extension/tools.js` + `server/src/contract.ts` and their switch cases if your

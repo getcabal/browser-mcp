@@ -44,6 +44,14 @@ for (const format of ['markdown', 'accessibility_tree', 'aria']) {
   assert.equal(await vm.runInContext('resolveUid(7, 3, false)', context), 3);
   assert.equal(await vm.runInContext('resolveUid(7, 4, false)', context), 4);
 }
+// A panel the connector closed to regain the tab is reported once, in the
+// next snapshot's header (extension-foreign-panels.mjs covers the closing).
+vm.runInContext("closedForeignPanels.set(7, new Set(['1Password']))", context);
+assert.match(
+  await vm.runInContext("takeSnapshotFor(7, {format: 'markdown'})", context),
+  /^Tab ID: 7\nFormat: markdown\nPage changed: (true|false)\nClosed 1Password's panel on this tab to restore page control; no settings changed\.\n/,
+);
+assert.doesNotMatch(await vm.runInContext("takeSnapshotFor(7, {format: 'markdown'})", context), /Closed 1Password/);
 stale = true;
 calls.length = 0;
 await assert.rejects(vm.runInContext('resolveUid(7, 2, false)', context), /stale/);

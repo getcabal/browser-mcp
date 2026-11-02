@@ -315,12 +315,182 @@ const attached = new Set();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function attach(tabId) {
-  try {
-    await chrome.debugger.attach({ tabId }, CDP_VERSION);
-  } catch (error) {
-    if (!/already attached/i.test(String(error?.message || error))) throw error;
+  const recovery = { round: 0, closed: new Set() };
+  for (;;) {
+    try {
+      await chrome.debugger.attach({ tabId }, CDP_VERSION);
+      break;
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (/already attached/i.test(message)) break;
+      if (!CROSS_EXTENSION_ATTACH.test(message)) throw error;
+      await recoverFromForeignPanel(tabId, recovery);
+    }
   }
   attached.add(tabId);
+  if (recovery.closed.size) {
+    const names = closedForeignPanels.get(tabId) || new Set();
+    for (const name of recovery.closed) names.add(name);
+    closedForeignPanels.set(tabId, names);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Another extension's in-page panel
+// ---------------------------------------------------------------------------
+
+// Chrome refuses chrome.debugger.attach on a tab that holds a frame of a
+// different extension. 1Password adds such frames for its passkey offers,
+// save-login prompts and in-field suggestion lists, and every page tool then
+// failed until the panel closed (Chief of Staff on Google's sign-in page,
+// November 1, 2026). By owner decision on November 1, 2026 the connector closes
+// a blocking 1Password panel itself: it removes the panel from that one tab,
+// never reads the panel's frame or 1Password's data, and changes no setting. It
+// never does this where the panel is a required passkey prompt (the agent
+// finishes that one with Computer Use), and it leaves every other extension's
+// frames alone.
+const CROSS_EXTENSION_ATTACH = /cannot access a chrome-extension:\/\/ url of different extension/i;
+const FOREIGN_PANEL_SETTLE_MS = [150, 400, 900];
+const CLOSABLE_PANEL_EXTENSIONS = Object.freeze({ aeblfdkhhhdcdjpifhhbdiojplfjncoa: '1Password' });
+
+function isRequiredPasskeyPage(rawUrl) {
+  let url;
+  try { url = new URL(String(rawUrl || '')); } catch { return false; }
+  // Google's passkey and security-key challenges: the provider prompt is the
+  // sign-in step itself (google-passkey-authentication.md).
+  return url.protocol === 'https:' && url.hostname === 'accounts.google.com'
+    && /\/challenge\/(?:pk|sk)(?:\/|$)/.test(url.pathname);
+}
+
+function foreignPanelError(tabId, reason) {
+  return new Error(
+    'Cannot access a chrome-extension:// URL of different extension: another extension\'s panel '
+    + `(for example a 1Password prompt) is open in tab ${tabId}, and Chrome blocks page tools on a tab `
+    + `while it is open. ${reason} This is not a connector failure: the connector is healthy and other `
+    + 'tabs still work. Finish or close the panel with Computer Use (a Google passkey prompt: '
+    + '~/.hermes/shared-integrations/google-passkey-authentication.md), then call take_snapshot again.',
+  );
+}
+
+// Runs inside the page (ISOLATED world, no access to the other extension's
+// frame). Keep it self-contained: chrome.scripting serializes the function.
+// Removes only frames of the closable extensions and reports which other
+// extensions' frames it saw and kept.
+function removeForeignExtensionFrames(ownId, closableIds) {
+  const found = [];
+  const visited = new Set();
+  const frameUrl = (element) => {
+    const name = element.localName;
+    if (name === 'iframe' || name === 'frame' || name === 'embed') return element.src || element.getAttribute('src') || '';
+    if (name === 'object') return element.data || element.getAttribute('data') || '';
+    return '';
+  };
+  const foreignId = (raw) => {
+    if (!raw) return null;
+    let url;
+    try { url = new URL(raw, document.baseURI); } catch { return null; }
+    return url.protocol === 'chrome-extension:' && url.hostname && url.hostname !== ownId ? url.hostname : null;
+  };
+  const shadowOf = (element) => {
+    try {
+      if (globalThis.chrome?.dom?.openOrClosedShadowRoot) return chrome.dom.openOrClosedShadowRoot(element);
+    } catch { /* fall back to an open root */ }
+    return element.shadowRoot || null;
+  };
+  const visit = (root) => {
+    if (!root || visited.has(root)) return;
+    visited.add(root);
+    let elements;
+    try { elements = root.querySelectorAll('*'); } catch { return; }
+    for (const element of elements) {
+      const id = foreignId(frameUrl(element));
+      if (id) found.push({ element, id });
+      const shadow = shadowOf(element);
+      if (shadow) visit(shadow);
+      if (element.localName === 'iframe' || element.localName === 'frame') {
+        let inner = null;
+        try { inner = element.contentDocument; } catch { inner = null; }
+        if (inner) visit(inner);
+      }
+    }
+  };
+  // Remove the extension's own wrapper element when the frame sits in one;
+  // never a page component that merely holds the frame next to page content.
+  const removalTarget = (frame) => {
+    const root = frame.getRootNode();
+    if (!root || !root.host) return frame;
+    const host = root.host;
+    if (!host.localName.includes('-') || host === document.documentElement || host === document.body) return frame;
+    if (root.querySelector('input, select, textarea, button, a[href], form, [contenteditable]')) return frame;
+    if (root.querySelectorAll('*').length > 60) return frame;
+    return host;
+  };
+  visit(document);
+  const ids = new Set();
+  const kept = new Set();
+  let removed = 0;
+  for (const { element, id } of found) {
+    if (!closableIds.includes(id)) {
+      kept.add(id);
+      continue;
+    }
+    const target = removalTarget(element);
+    if (!target.isConnected) continue;
+    target.remove();
+    removed += 1;
+    ids.add(id);
+  }
+  return { removed, ids: [...ids], kept: [...kept] };
+}
+
+async function closeForeignExtensionPanels(tabId) {
+  const injection = {
+    func: removeForeignExtensionFrames,
+    args: [chrome.runtime.id, Object.keys(CLOSABLE_PANEL_EXTENSIONS)],
+    world: 'ISOLATED',
+  };
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, ...injection });
+  } catch {
+    results = await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, ...injection });
+  }
+  const ids = new Set();
+  const kept = new Set();
+  let removed = 0;
+  for (const entry of results || []) {
+    const value = entry?.result;
+    if (!value || typeof value !== 'object') continue;
+    removed += Number.isInteger(value.removed) && value.removed > 0 ? value.removed : 0;
+    for (const id of Array.isArray(value.ids) ? value.ids : []) ids.add(String(id));
+    for (const id of Array.isArray(value.kept) ? value.kept : []) kept.add(String(id));
+  }
+  return { removed, ids: [...ids], kept: [...kept] };
+}
+
+async function recoverFromForeignPanel(tabId, recovery) {
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch { /* the caller's own call reports a closed tab */ }
+  if (tab && (isRequiredPasskeyPage(tab.url) || isRequiredPasskeyPage(tab.pendingUrl))) {
+    throw foreignPanelError(tabId, 'It was left open because this page is asking for a passkey.');
+  }
+  if (recovery.round >= FOREIGN_PANEL_SETTLE_MS.length) {
+    throw foreignPanelError(tabId, recovery.closed.size
+      ? `It came back after ${recovery.round} automatic attempts to close it.`
+      : 'The connector found no panel it may close; it may sit inside a frame the connector cannot reach.');
+  }
+  let outcome;
+  try {
+    outcome = await closeForeignExtensionPanels(tabId);
+  } catch {
+    throw foreignPanelError(tabId, 'The connector could not close it automatically.');
+  }
+  if (outcome.removed === 0 && outcome.kept.length > 0) {
+    throw foreignPanelError(tabId, 'It belongs to an extension the connector does not close by itself.');
+  }
+  for (const id of outcome.ids) recovery.closed.add(CLOSABLE_PANEL_EXTENSIONS[id] || 'another extension');
+  await sleep(FOREIGN_PANEL_SETTLE_MS[recovery.round]);
+  recovery.round += 1;
 }
 
 async function cdp(tabId, method, params = {}) {
@@ -479,6 +649,19 @@ async function pollUntil(probe, { timeoutMs, intervalMs = 250, describe }) {
 
 const snapshots = new Map(); // tabId -> Map(uid -> { backendNodeId, role, name })
 const snapshotHashes = new Map(); // `${tabId}:${format}` -> content hash
+const closedForeignPanels = new Map(); // tabId -> Set(extension name) the connector closed
+
+// The next snapshot of the tab says once that the connector closed a panel
+// (see recoverFromForeignPanel). Other results stay unchanged: protected flows
+// parse them as exactly one text block.
+function takeForeignPanelNote(tabId) {
+  const names = closedForeignPanels.get(tabId);
+  if (!names?.size) return '';
+  closedForeignPanels.delete(tabId);
+  const list = [...names];
+  const owner = list.length === 1 ? `${list[0]}'s panel` : `the panels of ${list.join(' and ')}`;
+  return `\nClosed ${owner} on this tab to restore page control; no settings changed.`;
+}
 
 const INTERACTIVE_ROLES = new Set([
   'button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio', 'combobox',
@@ -622,7 +805,7 @@ async function takeSnapshotFor(tabId, options = {}) {
   const hashKey = `${tabId}:${format}`;
   const previous = snapshotHashes.get(hashKey);
   snapshotHashes.set(hashKey, hash);
-  const header = `${await pageLines(tabId)}\nFormat: ${format}\nPage changed: ${previous === undefined || previous !== hash}`;
+  const header = `${await pageLines(tabId)}\nFormat: ${format}\nPage changed: ${previous === undefined || previous !== hash}${takeForeignPanelNote(tabId)}`;
   if (options.changedOnly === true && previous === hash) {
     return `${header}\nSnapshot unchanged (${hash})`;
   }
@@ -646,10 +829,18 @@ async function appendRequestedPageState(name, args, value) {
   if (format !== 'markdown' && format !== 'accessibility_tree') {
     throw new Error('pageStateFormat must be "markdown" or "accessibility_tree"');
   }
-  const tabId = await pageStateTarget(name, args, value);
-  const state = await takeSnapshotFor(tabId, { format });
   const result = toResult(value);
-  result.content.push({ type: 'text', text: `Page state (${format}) for tab ${tabId}:\n${state}` });
+  let tabId = null;
+  try {
+    tabId = await pageStateTarget(name, args, value);
+    const state = await takeSnapshotFor(tabId, { format });
+    result.content.push({ type: 'text', text: `Page state (${format}) for tab ${tabId}:\n${state}` });
+  } catch (error) {
+    // The action itself already succeeded. Report the missing page state
+    // instead of turning a completed navigation or click into a failure.
+    const where = tabId === null ? '' : ` for tab ${tabId}`;
+    result.content.push({ type: 'text', text: `Page state (${format})${where} is unavailable: ${String(error?.message || error)}` });
+  }
   return result;
 }
 
@@ -1329,6 +1520,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   snapshots.delete(tabId);
+  closedForeignPanels.delete(tabId);
   for (const key of snapshotHashes.keys()) if (key.startsWith(`${tabId}:`)) snapshotHashes.delete(key);
   attached.delete(tabId);
 });
