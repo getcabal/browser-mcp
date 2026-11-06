@@ -26,6 +26,9 @@ const switchSource = slice('  async switch_to_page(args) {', '  async take_snaps
 // Static wiring that the slices cannot show.
 assert.match(source, /capabilities: \[WINDOW_ISOLATION_CAPABILITY\]/, 'the hello advertises window mode');
 assert.match(source, /const WINDOW_ISOLATION_CAPABILITY = 'page-isolation-window';/);
+for (const constant of ['WINDOW_CASCADE_PX = 32', 'WINDOW_CASCADE_STEPS = 8', 'JOB_WINDOW_MIN_WIDTH = 1024', 'JOB_WINDOW_MIN_HEIGHT = 700']) {
+  assert.ok(source.includes(`const ${constant};`), `the test context mirrors ${constant}`);
+}
 assert.match(source, /pageIsolation = message\.options\?\.pageIsolation === 'window' \? 'window' : 'none';/,
   'each call sets the mode from its options, so a call without options is the default mode');
 assert.ok(source.indexOf("pageIsolation = message.options") < source.indexOf('const executor = executors[name];'),
@@ -59,6 +62,8 @@ function load(mode, chromeOptions) {
     pageIsolation: mode,
     WINDOW_CASCADE_PX: 32,
     WINDOW_CASCADE_STEPS: 8,
+    JOB_WINDOW_MIN_WIDTH: 1024,
+    JOB_WINDOW_MIN_HEIGHT: 700,
     attached: new Set(),
     focusEmulated: new Set(),
     attach: async (tabId) => { log.push(['attach', tabId]); context.attached.add(tabId); },
@@ -78,11 +83,13 @@ function load(mode, chromeOptions) {
 
 // --- openPageInOwnWindow: unfocused, normal, cascaded from the oldest window ---
 {
-  // Listed out of order and with a newer window focused: the oldest is the reference.
+  // Listed out of order and with a newer window focused: the oldest is the
+  // reference. Step 1 is held, so the new window takes step 2, and it ends
+  // where the oldest window ends so it stays on the screen.
   const windows = [
     { id: 9, focused: true, state: 'normal', left: 700, top: 600, width: 900, height: 700 },
     { id: 2, focused: false, state: 'normal', left: 0, top: 39, width: 2056, height: 1231 },
-    { id: 5, focused: false, state: 'normal', left: 32, top: 71, width: 2056, height: 1231 },
+    { id: 5, focused: false, state: 'normal', left: 32, top: 71, width: 2024, height: 1199 },
   ];
   const { context, calls } = load('window', { windows });
   const { tab, windowId } = await context.openPageInOwnWindow('https://example.com/a');
@@ -91,18 +98,52 @@ function load(mode, chromeOptions) {
   assert.deepEqual(plain(calls('windows.getAll')[0][1]), { windowTypes: ['normal'] });
   assert.deepEqual(plain(calls('windows.create')[0][1]), {
     url: 'https://example.com/a', focused: false, type: 'normal',
-    left: 0 + 32 * 3, top: 39 + 32 * 3, width: 2056, height: 1231,
+    left: 64, top: 39 + 64, width: 2056 - 64, height: 1231 - 64,
   });
 }
 {
-  // The cascade never drifts: with only the startup window open the first job
-  // window sits one step away, and it cycles back after eight steps.
-  for (const [count, step] of [[1, 1], [8, 8], [9, 1], [10, 2]]) {
-    const windows = Array.from({ length: count }, (_, i) => ({ id: 10 + i, focused: false, state: 'normal', left: 5 * i, top: 5 * i, width: 800, height: 600 }));
-    const { context, calls } = load('window', { windows });
+  // A job window takes the first step no open window holds: a window closed by
+  // a finished job frees its step, and a new window never lands on another.
+  const base = { id: 1, focused: false, state: 'normal', left: 0, top: 39, width: 2056, height: 1231 };
+  const at = (id, step) => ({ id, focused: false, state: 'normal', left: 32 * step, top: 39 + 32 * step, width: 2056 - 32 * step, height: 1231 - 32 * step });
+  for (const [open, step] of [
+    [[], 1],
+    [[at(2, 1)], 2],
+    [[at(2, 1), at(3, 2)], 3],
+    [[at(3, 2)], 1],
+    [[at(2, 1), at(4, 3)], 2],
+  ]) {
+    const { context, calls } = load('window', { windows: [base, ...open] });
     await context.openPageInOwnWindow('https://example.com/c');
+    assert.deepEqual(plain(calls('windows.create')[0][1]), {
+      url: 'https://example.com/c', focused: false, type: 'normal',
+      left: 32 * step, top: 39 + 32 * step, width: 2056 - 32 * step, height: 1231 - 32 * step,
+    }, `steps held: ${open.map((win) => win.left / 32).join(',') || 'none'}`);
+  }
+}
+{
+  // Every step held: fall back to counting, which never drifts past eight steps.
+  const windows = [{ id: 1, focused: false, state: 'normal', left: 0, top: 0, width: 2000, height: 1200 }];
+  for (let step = 1; step <= 8; step += 1) {
+    windows.push({ id: 1 + step, focused: false, state: 'normal', left: 32 * step, top: 32 * step, width: 2000 - 32 * step, height: 1200 - 32 * step });
+  }
+  const { context, calls } = load('window', { windows });
+  await context.openPageInOwnWindow('https://example.com/d');
+  const created = plain(calls('windows.create')[0][1]);
+  assert.deepEqual([created.left, created.top], [32, 32]);
+}
+{
+  // A job window never shrinks below a usable size, and a small oldest window
+  // lends its own size.
+  const held = (count) => Array.from({ length: count }, (_, i) => ({ id: 2 + i, focused: false, state: 'normal', left: 32 * (i + 1), top: 32 * (i + 1), width: 800, height: 600 }));
+  for (const [width, height, open, expected] of [
+    [1100, 750, held(7), [256, 256, 1024, 700]],
+    [900, 600, [], [32, 32, 900, 600]],
+  ]) {
+    const { context, calls } = load('window', { windows: [{ id: 1, focused: false, state: 'normal', left: 0, top: 0, width, height }, ...open] });
+    await context.openPageInOwnWindow('https://example.com/e');
     const created = plain(calls('windows.create')[0][1]);
-    assert.deepEqual([created.left, created.top], [32 * step, 32 * step], `${count} open windows`);
+    assert.deepEqual([created.left, created.top, created.width, created.height], expected, `${width}x${height}`);
   }
 }
 {

@@ -253,8 +253,9 @@ sends `options: {pageIsolation: "window"}` with every call, and the extension
 then:
 
 - opens every `new_page` in a window of its own (`chrome.windows.create`,
-  `focused: false`, cascaded from the oldest window so job windows never cover
-  each other completely); `focus` is ignored;
+  `focused: false`), placed on the first free 32-pixel step down and right of
+  the oldest window and ending where that window ends, so job windows stay on
+  the screen and never cover each other completely; `focus` is ignored;
 - makes `switch_to_page` activate the page inside its own window without
   raising or focusing any window;
 - turns on CDP focus emulation for each page it attaches to, so focus, blur

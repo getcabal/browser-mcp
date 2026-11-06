@@ -169,7 +169,8 @@ browser serves Marketing and four specialists). With the server started under
 `options.pageIsolation = "window"` and the extension sets its mode from each
 call, so a server without the variable gets exactly the old behaviour.
 
-In window mode each `new_page` is a window of its own, never focused;
+In window mode each `new_page` is a window of its own, never focused, placed
+on the first free step down and right of the oldest window and inside it;
 `switch_to_page` only activates the tab inside its window; CDP focus emulation
 is enabled once per attached tab; and page state is never taken from the
 active tab. The server refuses page tools that would fall back to the active

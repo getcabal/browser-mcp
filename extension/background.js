@@ -30,6 +30,8 @@ const FATAL_CLOSE_CODES = new Set([4400, 4403, 4426]);
 const WINDOW_ISOLATION_CAPABILITY = 'page-isolation-window';
 const WINDOW_CASCADE_PX = 32;
 const WINDOW_CASCADE_STEPS = 8;
+const JOB_WINDOW_MIN_WIDTH = 1024;
+const JOB_WINDOW_MIN_HEIGHT = 700;
 
 const log = (...args) => console.log('[local-mcp]', ...args);
 
@@ -611,17 +613,35 @@ function requireTabId(args, toolName) {
 // the oldest window so sibling job windows never cover each other completely.
 // The oldest window is a fixed reference: Chrome is rarely the active app, so
 // no window is focused, and stepping from the newest window would drift off
-// the screen over a day of jobs.
+// the screen over a day of jobs. A job window takes the first step no open
+// window already holds (a window closed by a finished job frees its step), and
+// it ends where the oldest window ends, so it stays on the screen.
+function jobWindowGeometry(normal) {
+  const base = normal[0];
+  if (!base || base.state !== 'normal'
+    || ![base.left, base.top, base.width, base.height].every((value) => Number.isFinite(value))) return {};
+  const taken = new Set(normal.map((win) => `${win.left},${win.top}`));
+  let step = 1 + ((normal.length - 1) % WINDOW_CASCADE_STEPS);
+  for (let candidate = 1; candidate <= WINDOW_CASCADE_STEPS; candidate += 1) {
+    const offset = WINDOW_CASCADE_PX * candidate;
+    if (!taken.has(`${base.left + offset},${base.top + offset}`)) {
+      step = candidate;
+      break;
+    }
+  }
+  const offset = WINDOW_CASCADE_PX * step;
+  return {
+    left: base.left + offset,
+    top: base.top + offset,
+    width: Math.max(base.width - offset, Math.min(base.width, JOB_WINDOW_MIN_WIDTH)),
+    height: Math.max(base.height - offset, Math.min(base.height, JOB_WINDOW_MIN_HEIGHT)),
+  };
+}
+
 async function openPageInOwnWindow(url) {
   const normal = (await chrome.windows.getAll({ windowTypes: ['normal'] }))
     .sort((a, b) => a.id - b.id);
-  const base = normal[0];
-  const geometry = {};
-  if (base && base.state === 'normal'
-    && [base.left, base.top, base.width, base.height].every((value) => Number.isFinite(value))) {
-    const offset = WINDOW_CASCADE_PX * (1 + ((normal.length - 1) % WINDOW_CASCADE_STEPS));
-    Object.assign(geometry, { left: base.left + offset, top: base.top + offset, width: base.width, height: base.height });
-  }
+  const geometry = jobWindowGeometry(normal);
   const created = await chrome.windows.create({ url, focused: false, type: 'normal', ...geometry });
   const tab = created?.tabs?.[0] ?? (await chrome.tabs.query({ windowId: created?.id }))[0];
   if (!tab || typeof tab.id !== 'number') throw new Error('Chrome did not report the page in the new window');
