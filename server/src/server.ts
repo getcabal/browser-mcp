@@ -17,6 +17,14 @@ import {
   readSystemClipboard,
 } from './protected-paste.js';
 import type { ClipboardReader } from './protected-paste.js';
+import {
+  describeWindowMode,
+  OLD_EXTENSION_MESSAGE,
+  requireOwnPage,
+  WINDOW_ISOLATION_CAPABILITY,
+  WINDOW_MODE_TOOLS,
+} from './page-isolation.js';
+import type { PageIsolation } from './page-isolation.js';
 
 export interface ServerOptions {
   port?: number;
@@ -27,6 +35,8 @@ export interface ServerOptions {
   clipboardReader?: ClipboardReader;
   credentialSocket?: string | null;
   requireTabBoundSecrets?: boolean;
+  /** 'window': every new page gets its own window and page tools must name their page. */
+  pageIsolation?: PageIsolation;
 }
 
 export class LocalMcpServer {
@@ -37,12 +47,14 @@ export class LocalMcpServer {
   private readonly clipboardReader: ClipboardReader | null;
   private readonly protectedPasteState = new ProtectedPasteState();
   private readonly credentialBroker: ProfileCredentialBroker | null;
+  private readonly pageIsolation: PageIsolation;
   private connected = false;
   private graceTimer: NodeJS.Timeout | null = null;
 
   constructor(options: ServerOptions = {}) {
     this.requireExtension = options.requireExtension ?? false;
     this.extensionConnectTimeoutMs = options.extensionConnectTimeoutMs ?? 90_000;
+    this.pageIsolation = options.pageIsolation ?? 'none';
     this.clipboardReader = options.clipboardReader
       ?? (options.credentialSocket ? null : readSystemClipboard);
     this.credentialBroker = options.credentialSocket
@@ -56,6 +68,7 @@ export class LocalMcpServer {
       port: options.port,
       debug: options.debug,
       profile: options.profile ?? null,
+      pageIsolation: this.pageIsolation,
     });
     this.mcp = new Server(
       { name: 'local-browser', version: VERSION },
@@ -64,7 +77,9 @@ export class LocalMcpServer {
 
     this.mcp.setRequestHandler(ListToolsRequestSchema, async () => {
       await this.bridge.waitForTools(3_000);
-      return { tools: enrichTools(this.bridge.getTools()) as unknown as Tool[] };
+      const tools = enrichTools(this.bridge.getTools());
+      const described = this.pageIsolation === 'window' ? tools.map(describeWindowMode) : tools;
+      return { tools: described as unknown as Tool[] };
     });
 
     this.mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -79,6 +94,11 @@ export class LocalMcpServer {
         if (request.params.name === 'press_key' && args.targetTabId !== undefined
           && !isProtectedSmsCaptureCall(request.params.name, args)) {
           throw new Error('targetTabId requires a protected SMS capture chord');
+        }
+        requireOwnPage(this.pageIsolation, request.params.name, args);
+        if (this.pageIsolation === 'window' && WINDOW_MODE_TOOLS.has(request.params.name)
+          && !this.bridge.hasCapability(WINDOW_ISOLATION_CAPABILITY)) {
+          throw new Error(OLD_EXTENSION_MESSAGE);
         }
         const result = isProtectedSmsCaptureCall(request.params.name, args)
           ? await captureProtectedServiceTitanSms(

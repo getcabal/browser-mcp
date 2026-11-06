@@ -245,6 +245,34 @@ untagged slot, and SMS steps no longer clear tab-bound values. With
 SMS capture chords accept a server-only `targetTabId`: the captured code is
 then pasted only on that provider page's tab.
 
+### Window mode for a browser several jobs share
+
+Set `BROWSER_MCP_PAGE_ISOLATION=window` on the server when several jobs use
+one browser at the same time. The wire contract stays Vibe 0.3.6; the server
+sends `options: {pageIsolation: "window"}` with every call, and the extension
+then:
+
+- opens every `new_page` in a window of its own (`chrome.windows.create`,
+  `focused: false`, cascaded from the oldest window so job windows never cover
+  each other completely); `focus` is ignored;
+- makes `switch_to_page` activate the page inside its own window without
+  raising or focusing any window;
+- turns on CDP focus emulation for each page it attaches to, so focus, blur
+  and `document.hasFocus()` behave as in the front window;
+- shows each page's window id in `list_pages`
+  (`Page 12 [ACTIVE]: "Title" [window 5] - https://…`), and never reports the
+  page state of whatever page happens to be active.
+
+The server refuses `take_snapshot`, `evaluate_script`, `wait_for_url`,
+`wait_for_network_idle`, `wait_for_condition` (and the local extras) when the
+call names no page, because the active page usually belongs to another job.
+An extension that does not advertise the `page-isolation-window` capability in
+its hello cannot run `new_page` or `switch_to_page` in this mode: the server
+refuses them with "reload the extension" instead of silently sharing tabs.
+Pages stay live behind other windows only when Chrome runs with
+`--disable-backgrounding-occluded-windows`; minimized windows and background
+tabs are still hidden. Leave the variable unset for the default behaviour.
+
 ### The uid workflow
 
 Call `take_snapshot` before interacting with elements. It returns compact
@@ -429,6 +457,12 @@ The suite, in order:
 8. **browser-e2e** — loads a stamped extension into a real headless Chromium
    and exercises the full 24-tool surface against local test pages, including
    readiness, uids, key chords, uploads, waits, and screenshots.
+
+`extension-window-mode` and `page-isolation` cover window mode: the
+extension's window, switching, page-list and focus-emulation code against a
+fake `chrome`, and the real stdio server's refusals, old-extension check and
+default-mode wire format. Run every suite except `browser-e2e` on fleet hosts,
+where headless browsers are not allowed.
 
 The browser suite is **hard-required**: `npm test` fails with a clear error if
 no suitable Chrome binary is found. Note that branded Google Chrome 137+

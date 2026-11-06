@@ -161,6 +161,23 @@ sorted entries) plus `artifacts.json` content hashes, and
 `scripts/doctor.mjs --extension-dir` hashes an installed copy before parsing
 its inert JSON config, then proves the version/profile/port and locked state.
 
+## Window mode (shared browser)
+
+One profile browser can serve several jobs at once (the fleet's Marketing
+browser serves Marketing and four specialists). With the server started under
+`BROWSER_MCP_PAGE_ISOLATION=window`, every call frame carries
+`options.pageIsolation = "window"` and the extension sets its mode from each
+call, so a server without the variable gets exactly the old behaviour.
+
+In window mode each `new_page` is a window of its own, never focused;
+`switch_to_page` only activates the tab inside its window; CDP focus emulation
+is enabled once per attached tab; and page state is never taken from the
+active tab. The server refuses page tools that would fall back to the active
+tab when no page is named, and refuses `new_page`/`switch_to_page` unless the
+promoted extension's hello lists the `page-isolation-window` capability. The
+mode needs no schema change and no new tool, so the Vibe contract and its
+fixture stay byte-identical.
+
 ## Hermes process integration
 
 The raw stdio server deliberately does not launch Chrome. Hermes deployments

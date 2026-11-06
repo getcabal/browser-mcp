@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { WebSocket, WebSocketServer } from 'ws';
 import { PROTOCOL_VERSION, VERSION, validateExtensionTools } from './contract.js';
 import type { ToolDefinition } from './contract.js';
+import type { PageIsolation } from './page-isolation.js';
 
 export type { ToolDefinition } from './contract.js';
 
@@ -25,6 +26,8 @@ export interface BridgeOptions {
   debug?: boolean;
   profile?: string | null;
   handshakeTimeoutMs?: number;
+  /** Sent with every call so the extension applies one page-isolation mode per connector. */
+  pageIsolation?: PageIsolation;
 }
 
 export interface ContractStatus {
@@ -43,6 +46,11 @@ export const CLOSE_PROFILE_MISMATCH = 4403;
 export const CLOSE_PROTOCOL_MISMATCH = 4426;
 
 const formatProfile = (profile: string | null) => (profile === null ? '(none)' : JSON.stringify(profile));
+
+function readCapabilities(hello: Record<string, unknown>): Set<string> {
+  const list = Array.isArray(hello.capabilities) ? hello.capabilities : [];
+  return new Set(list.filter((item): item is string => typeof item === 'string'));
+}
 
 /**
  * Loopback-only WebSocket bridge between the MCP server and the extension.
@@ -65,6 +73,8 @@ export class LocalExtensionBridge extends EventEmitter {
   private requestSequence = 0;
   private readonly pending = new Map<string, PendingCall>();
   private stopped = false;
+  private readonly pageIsolation: PageIsolation;
+  private capabilities = new Set<string>();
 
   constructor(options: BridgeOptions = {}) {
     super();
@@ -72,6 +82,7 @@ export class LocalExtensionBridge extends EventEmitter {
     this.debug = options.debug ?? false;
     this.profile = options.profile ?? null;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    this.pageIsolation = options.pageIsolation ?? 'none';
   }
 
   async start(): Promise<void> {
@@ -166,6 +177,7 @@ export class LocalExtensionBridge extends EventEmitter {
   private promote(socket: WebSocket, hello: Record<string, unknown>): void {
     const previous = this.extension;
     this.extension = socket;
+    this.capabilities = readCapabilities(hello);
     this.log(`extension connected (profile ${formatProfile(this.profile)}, extension version ${String(hello.extensionVersion ?? 'unknown')})`);
 
     socket.on('message', (raw) => {
@@ -176,6 +188,7 @@ export class LocalExtensionBridge extends EventEmitter {
       if (this.extension !== socket) return;
       this.extension = null;
       this.tools = [];
+      this.capabilities = new Set();
       this.log('extension disconnected');
       this.emit('toolsChanged');
     });
@@ -220,6 +233,7 @@ export class LocalExtensionBridge extends EventEmitter {
     switch (message.type) {
       case 'connected': {
         // Heartbeat hello from the promoted extension; answer to keep it alive.
+        this.capabilities = readCapabilities(message);
         if (this.extension) this.sendPong(this.extension);
         return;
       }
@@ -281,6 +295,11 @@ export class LocalExtensionBridge extends EventEmitter {
     return this.tools;
   }
 
+  /** Whether the promoted extension advertised a capability in its latest hello. */
+  hasCapability(name: string): boolean {
+    return this.isConnected() && this.capabilities.has(name);
+  }
+
   /** Synchronous contract check of the currently advertised tools. */
   contractStatus(): ContractStatus {
     if (!this.isConnected()) return { ok: false, problems: ['no extension connected'] };
@@ -328,7 +347,9 @@ export class LocalExtensionBridge extends EventEmitter {
 
   callTool(name: string, args: Record<string, unknown>, timeoutMs = DEFAULT_CALL_TIMEOUT_MS): Promise<ToolResult> {
     const requestId = `local_${Date.now()}_${++this.requestSequence}`;
-    const message = JSON.stringify({ type: 'call_tool', requestId, name, args });
+    const message = JSON.stringify(this.pageIsolation === 'none'
+      ? { type: 'call_tool', requestId, name, args }
+      : { type: 'call_tool', requestId, name, args, options: { pageIsolation: this.pageIsolation } });
     return new Promise<ToolResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);

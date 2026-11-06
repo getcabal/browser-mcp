@@ -18,8 +18,9 @@ export function freePort() {
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class FakeExtension {
-  constructor({ port, profile = null, protocolVersion = TEST_PROTOCOL_VERSION, tools = [], handlers = {}, autoHello = true, autoRespond = true }) {
+  constructor({ port, profile = null, protocolVersion = TEST_PROTOCOL_VERSION, tools = [], handlers = {}, autoHello = true, autoRespond = true, capabilities = null }) {
     this.port = port;
+    this.capabilities = capabilities;
     this.profile = profile;
     this.protocolVersion = protocolVersion;
     this.tools = tools;
@@ -69,6 +70,7 @@ export class FakeExtension {
       profile: this.profile,
       protocolVersion: this.protocolVersion,
       extensionVersion: '1.1.0-test',
+      ...(this.capabilities ? { capabilities: this.capabilities } : {}),
     });
   }
 

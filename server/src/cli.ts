@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { LocalMcpServer } from './server.js';
 import { VERSION } from './contract.js';
+import { parsePageIsolation } from './page-isolation.js';
 import { resolve } from 'node:path';
 
 const USAGE = `local-browser-mcp ${VERSION} — local-only browser MCP server (stdio)
@@ -21,6 +22,9 @@ Options:
 Environment:
   BROWSER_MCP_STATE_DIR                  Directory for the profile credential socket
   BROWSER_MCP_REQUIRE_TAB_BOUND_SECRETS  Set to 1 to accept only tab-bound staged secrets
+  BROWSER_MCP_PAGE_ISOLATION             Set to "window" when several jobs share this browser:
+                                         every new page opens in its own window, no window is
+                                         brought to the front, and page tools must name a page
 `;
 
 function fail(message: string): never {
@@ -92,6 +96,12 @@ const credentialSocket = profile && stateDir
   ? resolve(stateDir, 'credential.sock')
   : null;
 const requireTabBoundSecrets = (process.env.BROWSER_MCP_REQUIRE_TAB_BOUND_SECRETS ?? '').trim() === '1';
+let pageIsolation: ReturnType<typeof parsePageIsolation>;
+try {
+  pageIsolation = parsePageIsolation(process.env.BROWSER_MCP_PAGE_ISOLATION);
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
+}
 const server = new LocalMcpServer({
   port,
   debug,
@@ -100,6 +110,7 @@ const server = new LocalMcpServer({
   extensionConnectTimeoutMs,
   credentialSocket,
   requireTabBoundSecrets,
+  pageIsolation,
 });
 let shuttingDown = false;
 const shutdown = (exitCode: number): void => {

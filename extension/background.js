@@ -25,6 +25,11 @@ const CDP_VERSION = '1.3';
 const COMPLETED_CAP = 1000;
 const MAX_SNAPSHOT_LINES = 800;
 const FATAL_CLOSE_CODES = new Set([4400, 4403, 4426]);
+// Window mode (connector BROWSER_MCP_PAGE_ISOLATION=window): several jobs share
+// this browser, so each new page gets its own window and nothing is raised.
+const WINDOW_ISOLATION_CAPABILITY = 'page-isolation-window';
+const WINDOW_CASCADE_PX = 32;
+const WINDOW_CASCADE_STEPS = 8;
 
 const log = (...args) => console.log('[local-mcp]', ...args);
 
@@ -45,6 +50,8 @@ let activeConfig = {
   locked: DEFAULT_CONFIG.locked === true,
 };
 let fatalMemory = null;
+// Set from each call's options; one connector always sends the same mode.
+let pageIsolation = 'none';
 
 async function resolveConfig() {
   let port = DEFAULT_CONFIG.port;
@@ -162,6 +169,7 @@ function sendHello() {
     profile: activeConfig.profile ?? null,
     protocolVersion: PROTOCOL_VERSION,
     extensionVersion: chrome.runtime.getManifest().version,
+    capabilities: [WINDOW_ISOLATION_CAPABILITY],
   });
 }
 
@@ -279,6 +287,7 @@ async function handleCall(message) {
   if (completed.has(requestId)) { send(completed.get(requestId)); return; }
   if (inFlight.has(requestId)) return;
   const args = message.args && typeof message.args === 'object' ? message.args : {};
+  pageIsolation = message.options?.pageIsolation === 'window' ? 'window' : 'none';
   const progressTimer = setInterval(() => {
     send({ type: 'tool_progress', requestId, message: `${name} still running` });
   }, PROGRESS_INTERVAL_MS);
@@ -311,6 +320,7 @@ async function handleCall(message) {
 // ---------------------------------------------------------------------------
 
 const attached = new Set();
+const focusEmulated = new Set();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -495,17 +505,32 @@ async function recoverFromForeignPanel(tabId, recovery) {
 
 async function cdp(tabId, method, params = {}) {
   if (!attached.has(tabId)) await attach(tabId);
+  await ensureFocusEmulation(tabId);
   try {
     return await chrome.debugger.sendCommand({ tabId }, method, params);
   } catch (error) {
     if (/not attached|detached/i.test(String(error?.message || error))) {
       attached.delete(tabId);
+      focusEmulated.delete(tabId);
       await sleep(75);
       await attach(tabId);
+      await ensureFocusEmulation(tabId);
       return await chrome.debugger.sendCommand({ tabId }, method, params);
     }
     throw error;
   }
+}
+
+// In window mode no window is raised, so a page usually sits in a window that
+// does not have the system focus. Focus emulation lets focus, blur and
+// document.hasFocus() behave as they would in the front window. Best effort:
+// input still reaches the page through CDP without it.
+async function ensureFocusEmulation(tabId) {
+  if (pageIsolation !== 'window' || focusEmulated.has(tabId)) return;
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+    focusEmulated.add(tabId);
+  } catch { /* the command below reports a real detach */ }
 }
 
 function describeException(exceptionDetails) {
@@ -580,6 +605,33 @@ function requireTabId(args, toolName) {
     throw new Error(`${toolName} requires tabId`);
   }
   return args.tabId;
+}
+
+// Window mode: open a page in a window of its own, never focused, cascaded from
+// the oldest window so sibling job windows never cover each other completely.
+// The oldest window is a fixed reference: Chrome is rarely the active app, so
+// no window is focused, and stepping from the newest window would drift off
+// the screen over a day of jobs.
+async function openPageInOwnWindow(url) {
+  const normal = (await chrome.windows.getAll({ windowTypes: ['normal'] }))
+    .sort((a, b) => a.id - b.id);
+  const base = normal[0];
+  const geometry = {};
+  if (base && base.state === 'normal'
+    && [base.left, base.top, base.width, base.height].every((value) => Number.isFinite(value))) {
+    const offset = WINDOW_CASCADE_PX * (1 + ((normal.length - 1) % WINDOW_CASCADE_STEPS));
+    Object.assign(geometry, { left: base.left + offset, top: base.top + offset, width: base.width, height: base.height });
+  }
+  const created = await chrome.windows.create({ url, focused: false, type: 'normal', ...geometry });
+  const tab = created?.tabs?.[0] ?? (await chrome.tabs.query({ windowId: created?.id }))[0];
+  if (!tab || typeof tab.id !== 'number') throw new Error('Chrome did not report the page in the new window');
+  return { tab, windowId: created.id };
+}
+
+// Window mode: make a page the active page of its own window without raising it.
+async function activateWithoutRaising(pageId) {
+  await chrome.tabs.get(pageId);
+  return chrome.tabs.update(pageId, { active: true });
 }
 
 async function pageLines(tabId) {
@@ -813,13 +865,17 @@ async function takeSnapshotFor(tabId, options = {}) {
 }
 
 async function pageStateTarget(name, args, value) {
-  if (name === 'close_page') return activeTabId({});
+  if (name === 'close_page') {
+    if (pageIsolation === 'window') throw new Error('not reported after closing a page in a shared browser');
+    return activeTabId({});
+  }
   if (typeof args.pageId === 'number') return args.pageId;
   if (typeof args.tabId === 'number') return args.tabId;
   if (name === 'new_page' && typeof value === 'string') {
     const match = value.match(/Tab ID: (\d+)/);
     if (match) return Number(match[1]);
   }
+  if (pageIsolation === 'window') throw new Error('this call named no page');
   return activeTabId({});
 }
 
@@ -1104,7 +1160,10 @@ async function dispatchClick(tabId, point, modifiers = 0) {
 }
 
 chrome.debugger.onDetach.addListener((source) => {
-  if (typeof source.tabId === 'number') attached.delete(source.tabId);
+  if (typeof source.tabId === 'number') {
+    attached.delete(source.tabId);
+    focusEmulated.delete(source.tabId);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1127,13 +1186,20 @@ const executors = {
     tabs.sort((a, b) => (a.id || 0) - (b.id || 0));
     const lines = tabs.map((tab) => {
       const active = tab.active ? ' [ACTIVE]' : '';
-      return `Page ${tab.id}${active}: "${tab.title || ''}" - ${redactSensitiveUrl(tab.url || tab.pendingUrl || '')}`;
+      const windowNote = pageIsolation === 'window' ? ` [window ${tab.windowId}]` : '';
+      return `Page ${tab.id}${active}: "${tab.title || ''}"${windowNote} - ${redactSensitiveUrl(tab.url || tab.pendingUrl || '')}`;
     });
     return [`Found ${tabs.length} page(s):`, ...lines].join('\n');
   },
 
   async new_page(args) {
     const url = args.url === undefined || args.url === null || args.url === '' ? 'about:blank' : allowedUrl(args.url);
+    if (pageIsolation === 'window') {
+      const { tab, windowId } = await openPageInOwnWindow(url);
+      let warning = '';
+      if (args.waitForReady !== false && url !== 'about:blank') warning = await waitForReady(tab.id, 45_000);
+      return `Opened new page in its own window ${windowId}, not brought to the front${warning}\n${await pageLines(tab.id)}`;
+    }
     const focus = args.focus === true;
     const tab = await chrome.tabs.create({ url, active: focus });
     let warning = '';
@@ -1164,10 +1230,14 @@ const executors = {
 
   async switch_to_page(args) {
     const pageId = requirePageId(args, 'switch_to_page');
-    const target = await chrome.tabs.get(pageId);
-    try { await chrome.windows.update(target.windowId, { focused: true }); } catch { /* headless focus is unavailable */ }
-    const tab = await chrome.tabs.update(pageId, { active: true });
-    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch { /* headless or gone */ }
+    if (pageIsolation === 'window') {
+      await activateWithoutRaising(pageId);
+    } else {
+      const target = await chrome.tabs.get(pageId);
+      try { await chrome.windows.update(target.windowId, { focused: true }); } catch { /* headless focus is unavailable */ }
+      const tab = await chrome.tabs.update(pageId, { active: true });
+      try { await chrome.windows.update(tab.windowId, { focused: true }); } catch { /* headless or gone */ }
+    }
     let warning = '';
     if (args.waitForReady !== false) warning = await waitForReady(pageId, 15_000);
     if (args.waitForReady !== false && !warning) {
@@ -1519,6 +1589,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  focusEmulated.delete(tabId);
   snapshots.delete(tabId);
   closedForeignPanels.delete(tabId);
   for (const key of snapshotHashes.keys()) if (key.startsWith(`${tabId}:`)) snapshotHashes.delete(key);
