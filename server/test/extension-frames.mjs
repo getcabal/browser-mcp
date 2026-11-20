@@ -143,3 +143,53 @@ child.field.ownerDocument.activeElement = {};
 assert.throws(() => apply.call(child.field, 'must-not-type', true), /could not be focused/);
 assert.equal(child.field.value, 'synthetic-replacement');
 console.log('same-origin frame snapshots and exact protected entry checks passed');
+
+// Chrome's AX list is not in page order: the snapshot walks childIds from the
+// root, and a same-origin frame's nodes sit under the iframe that holds them.
+{
+  const node = (nodeId, backendDOMNodeId, role, name, parentId, childIds = []) => ({
+    ...ax(nodeId, backendDOMNodeId, role, name), parentId, childIds,
+  });
+  const orderTree = frame('page');
+  orderTree.childFrames = [frame('inner')];
+  const orderTrees = {
+    page: [
+      node('5', 15, 'option', 'Annual', '3'),
+      node('1', 11, 'RootWebArea', 'Page', undefined, ['2', '6', '7']),
+      node('4', 14, 'option', 'Monthly', '3'),
+      node('7', 17, 'link', 'Last', '1'),
+      node('3', 13, 'combobox', 'Plan', '2', ['4', '5']),
+      node('2', 12, 'main', 'Main', '1', ['3']),
+      node('6', 16, 'Iframe', 'Inner', '1'),
+    ],
+    inner: [node('2', 22, 'button', 'Inside', '1'), node('1', 21, 'RootWebArea', 'Inner doc', undefined, ['2'])],
+  };
+  const orderContext = vm.createContext({
+    MAX_SNAPSHOT_LINES: 100, isSensitiveInputNode, redactSensitiveAccessibleName,
+    pageLines: async () => 'Tab ID: 8',
+    callOnElement: async () => true,
+    cdp: async (_tab, method, args) => {
+      if (method === 'Page.getFrameTree') return { frameTree: orderTree };
+      if (method === 'DOM.getFrameOwner') return { backendNodeId: 16 };
+      if (method === 'Accessibility.getFullAXTree') return { nodes: orderTrees[args.frameId] };
+      if (method === 'DOM.describeNode') return { node: { attributes: [] } };
+      throw new Error(`unexpected ${method}`);
+    },
+  });
+  vm.runInContext(source.slice(source.indexOf('const snapshots ='), source.indexOf('async function elementCenter')), orderContext);
+  const aria = await vm.runInContext("takeSnapshotFor(8, {format: 'aria'})", orderContext);
+  assert.equal(aria.split('\n').slice(3).join('\n'), [
+    'RootWebArea "Page" [uid=@e1]',
+    '  main "Main" [uid=@e2]',
+    '    combobox "Plan" [uid=@e3]',
+    '      option "Monthly" [uid=@e4]',
+    '      option "Annual" [uid=@e5]',
+    '  Iframe "Inner" [uid=@e6]',
+    '    RootWebArea "Inner doc" [uid=@e7]',
+    '      button "Inside" [uid=@e8]',
+    '  link "Last" [uid=@e9]',
+  ].join('\n'));
+  // A node whose parent is missing still appears, after the ordered ones.
+  orderTrees.page.push(node('9', 19, 'button', 'Orphan', '42'));
+  assert.match(await vm.runInContext("takeSnapshotFor(8, {format: 'aria'})", orderContext), /link "Last" \[uid=@e9\]\nbutton "Orphan" \[uid=@e10\]$/);
+}

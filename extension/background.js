@@ -749,10 +749,10 @@ async function accessibilityNodes(tabId, { maxDepth, scopeSelector } = {}) {
     const { nodeId } = await cdp(tabId, 'DOM.querySelector', { nodeId: root.nodeId, selector: scopeSelector });
     if (!nodeId) throw new Error(`scopeSelector matched no element: ${scopeSelector}`);
     const { node } = await cdp(tabId, 'DOM.describeNode', { nodeId });
-    return (await cdp(tabId, 'Accessibility.getPartialAXTree', {
+    return documentOrder((await cdp(tabId, 'Accessibility.getPartialAXTree', {
       backendNodeId: node.backendNodeId,
       fetchRelatives: true,
-    })).nodes || [];
+    })).nodes || []);
   }
   const params = {};
   if (typeof maxDepth === 'number' && Number.isFinite(maxDepth) && maxDepth > 0) {
@@ -763,9 +763,10 @@ async function accessibilityNodes(tabId, { maxDepth, scopeSelector } = {}) {
   const seen = new Set();
   const visit = async (tree, parentId) => {
     const frameId = tree.frame.id;
+    let owner;
     if (parentId) {
       if (!tree.frame.securityOrigin || tree.frame.securityOrigin !== frameTree.frame.securityOrigin) return;
-      const owner = await cdp(tabId, 'DOM.getFrameOwner', { frameId });
+      owner = await cdp(tabId, 'DOM.getFrameOwner', { frameId });
       const visible = await callOnElement(tabId, owner.backendNodeId, `function() {
         return !!this.contentDocument && !!this.getClientRects().length
           && this.ownerDocument.defaultView.getComputedStyle(this).visibility !== 'hidden';
@@ -777,7 +778,9 @@ async function accessibilityNodes(tabId, { maxDepth, scopeSelector } = {}) {
       if (seen.has(node.backendDOMNodeId)) continue;
       if (typeof node.backendDOMNodeId === 'number') seen.add(node.backendDOMNodeId);
       nodes.push({ ...node, frameId, nodeId: `${frameId}:${node.nodeId}`,
-        parentId: node.parentId ? `${frameId}:${node.parentId}` : undefined });
+        parentId: node.parentId ? `${frameId}:${node.parentId}` : undefined,
+        childIds: (node.childIds || []).map((id) => `${frameId}:${id}`),
+        ownerBackendNodeId: !node.parentId && owner ? owner.backendNodeId : undefined });
     }
     for (const child of tree.childFrames || []) {
       try {
@@ -792,7 +795,49 @@ async function accessibilityNodes(tabId, { maxDepth, scopeSelector } = {}) {
     }
   };
   await visit(frameTree);
-  return nodes;
+  return documentOrder(nodes);
+}
+
+// Chrome lists a frame's accessibility nodes in its own order, not the page's.
+// Walk each tree from its root through childIds so a snapshot reads top to
+// bottom, and place a same-origin frame's nodes under the iframe that holds it.
+function documentOrder(nodes) {
+  const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+  const framesByOwner = new Map();
+  for (const node of nodes) {
+    if (node.ownerBackendNodeId === undefined) continue;
+    if (!framesByOwner.has(node.ownerBackendNodeId)) framesByOwner.set(node.ownerBackendNodeId, []);
+    framesByOwner.get(node.ownerBackendNodeId).push(node);
+  }
+  const owners = new Map();
+  for (const node of nodes) {
+    if (typeof node.backendDOMNodeId === 'number' && framesByOwner.has(node.backendDOMNodeId)) owners.set(node.backendDOMNodeId, node);
+  }
+  const ordered = [];
+  const placed = new Set();
+  const place = (root, parentId) => {
+    const stack = [[root, parentId]];
+    while (stack.length) {
+      const [node, parent] = stack.pop();
+      if (placed.has(node.nodeId)) continue;
+      placed.add(node.nodeId);
+      ordered.push(parent === node.parentId ? node : { ...node, parentId: parent });
+      const next = (node.childIds || []).map((id) => byId.get(id))
+        .filter((child) => child && child.parentId === node.nodeId)
+        .map((child) => [child, node.nodeId]);
+      for (const frameRoot of framesByOwner.get(node.backendDOMNodeId) || []) next.push([frameRoot, node.nodeId]);
+      for (let index = next.length - 1; index >= 0; index -= 1) stack.push(next[index]);
+    }
+  };
+  for (const node of nodes) {
+    const parent = node.parentId && byId.get(node.parentId);
+    if (parent) continue;
+    if (node.ownerBackendNodeId !== undefined && owners.has(node.ownerBackendNodeId)) continue;
+    place(node, node.parentId);
+  }
+  // Anything a broken parent link left out keeps Chrome's order at the end.
+  for (const node of nodes) if (!placed.has(node.nodeId)) place(node, node.parentId);
+  return ordered;
 }
 
 function hashText(text) {
