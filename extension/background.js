@@ -849,6 +849,14 @@ function hashText(text) {
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
+// A link node's http(s) address from its accessibility properties; anything else (javascript:, data:, an
+// address too long to be useful) is left out.
+function linkUrlOf(node) {
+  const value = (node.properties || []).find((p) => p?.name === 'url')?.value?.value;
+  if (typeof value !== 'string' || value.length > 2048 || !/^https?:\/\//i.test(value)) return '';
+  return value.replace(/\s/g, (c) => encodeURIComponent(c));
+}
+
 async function takeSnapshotFor(tabId, options = {}) {
   const format = options.format || 'markdown';
   if (!['markdown', 'accessibility_tree', 'aria'].includes(format)) {
@@ -909,7 +917,12 @@ async function takeSnapshotFor(tabId, options = {}) {
     if (lines.length < MAX_SNAPSHOT_LINES) {
       const depth = depthFor(node);
       if (format === 'markdown') lines.push(`${uid} [${role}] ${JSON.stringify(outputName)}`);
-      else if (format === 'aria') lines.push(`${'  '.repeat(depth)}${role} ${JSON.stringify(outputName)} [uid=${uid}]`);
+      else if (format === 'aria') {
+        lines.push(`${'  '.repeat(depth)}${role} ${JSON.stringify(outputName)} [uid=${uid}]`);
+        // A link's address, as Playwright's aria snapshot gives it, so a reader can open the page without a click.
+        const url = role.toLowerCase() === 'link' && !sensitiveAncestorFor(node) ? linkUrlOf(node) : '';
+        if (url && lines.length < MAX_SNAPSHOT_LINES) lines.push(`${'  '.repeat(depth + 1)}/url: ${url}`);
+      }
       else lines.push(`${'  '.repeat(depth)}${uid} role=${JSON.stringify(role)} name=${JSON.stringify(outputName)}`);
     } else {
       omitted += 1;

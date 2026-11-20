@@ -157,7 +157,7 @@ console.log('same-origin frame snapshots and exact protected entry checks passed
       node('5', 15, 'option', 'Annual', '3'),
       node('1', 11, 'RootWebArea', 'Page', undefined, ['2', '6', '7']),
       node('4', 14, 'option', 'Monthly', '3'),
-      node('7', 17, 'link', 'Last', '1'),
+      { ...node('7', 17, 'link', 'Last', '1'), properties: [{ name: 'url', value: { type: 'string', value: 'https://example.test/last?a=1' } }] },
       node('3', 13, 'combobox', 'Plan', '2', ['4', '5']),
       node('2', 12, 'main', 'Main', '1', ['3']),
       node('6', 16, 'Iframe', 'Inner', '1'),
@@ -188,8 +188,14 @@ console.log('same-origin frame snapshots and exact protected entry checks passed
     '    RootWebArea "Inner doc" [uid=@e7]',
     '      button "Inside" [uid=@e8]',
     '  link "Last" [uid=@e9]',
+    '    /url: https://example.test/last?a=1',
   ].join('\n'));
   // A node whose parent is missing still appears, after the ordered ones.
   orderTrees.page.push(node('9', 19, 'button', 'Orphan', '42'));
-  assert.match(await vm.runInContext("takeSnapshotFor(8, {format: 'aria'})", orderContext), /link "Last" \[uid=@e9\]\nbutton "Orphan" \[uid=@e10\]$/);
+  assert.match(await vm.runInContext("takeSnapshotFor(8, {format: 'aria'})", orderContext), /link "Last" \[uid=@e9\]\n    \/url: https:\/\/example\.test\/last\?a=1\nbutton "Orphan" \[uid=@e10\]$/);
+  // Only an http(s) link address is shown, and only in the aria format.
+  orderTrees.page.push({ ...node('10', 20, 'link', 'Script', '42'), properties: [{ name: 'url', value: { type: 'string', value: 'javascript:void(0)' } }] });
+  assert.doesNotMatch(await vm.runInContext("takeSnapshotFor(8, {format: 'aria'})", orderContext), /javascript:/);
+  assert.doesNotMatch(await vm.runInContext("takeSnapshotFor(8, {format: 'markdown'})", orderContext), /\/url:/);
+  assert.doesNotMatch(await vm.runInContext("takeSnapshotFor(8, {format: 'accessibility_tree'})", orderContext), /\/url:/);
 }
